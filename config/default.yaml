@@ -1,0 +1,11 @@
+# Default configuration for FL with optional HE
+num_clients: 5
+rounds: 5
+local_epochs: 1
+batch_size: 64
+lr: 0.01
+seed: 42
+partition: iid          # iid or dirichlet
+dirichlet_alpha: 0.5
+use_encryption: false   # set true when HE context implemented
+no_cuda: false
