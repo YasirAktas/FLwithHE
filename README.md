@@ -16,7 +16,6 @@ src/
     encryption.py        # PlainContext ve gelecekte HE context
 config/
   default.yaml           # Varsayılan hiperparametreler
-FedAvg_Mnist.py          # İlk tek dosya örneği (korundu)
 requirements.txt
 README.md
 ```
@@ -51,22 +50,21 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-5) Hızlı test (orijinal tek dosya)
-```cmd
-python FedAvg_Mnist.py --num_clients 2 --rounds 1 --local_epochs 1 --no_cuda
-```
-
-6) Modüler runner (önerilen)
+5) Modüler runner (önerilen)
 ```cmd
 python -m src.fl.fedavg_runner --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
 ```
 
-7) Non-IID (Dirichlet) veri dağılımı
+6) Non-IID (Dirichlet) veri dağılımı
 ```cmd
-python -m src.fl.fedavg_runner --partition dirichlet --dirichlet_alpha 0.3
+python -m src.fl.fedavg_runner --num_clients 5 --rounds 5 --local_epochs 1 --partition dirichlet --dirichlet_alpha 0.3
 ```
+Açıklama:
+- `partition=dirichlet`: Sınıf dağılımını istemciler arasında dengesiz (heterojen) yapar.
+- `dirichlet_alpha`: Küçük değer → daha heterojen (bazı istemciler bazı sınıfları daha çok görür). Büyük değer → IID'ye yaklaşır.
+Örn. `alpha=0.3` daha gerçekçi, heterojen bir dağılım üretir; yakınsama IID'ye göre biraz daha yavaş olabilir.
 
-8) CUDA kapatma/açma
+7) CUDA kapatma/açma
 - Kapatma: `--no_cuda`
 - Açık bırakmak için ek bir bayrak gerekmez (GPU varsa otomatik kullanılır)
 
@@ -75,7 +73,7 @@ python -m src.fl.fedavg_runner --partition dirichlet --dirichlet_alpha 0.3
 python -m src.fl.fedavg_runner --num_clients 5 --rounds 3 --no_cuda
 ```
 
-9) Şifreleme kancası (şimdilik stub)
+8) Şifreleme kancası (şimdilik stub)
 ```cmd
 python -m src.fl.fedavg_runner --use_encryption
 ```
@@ -140,5 +138,5 @@ python -m src.fl.fedavg_runner --no_cuda
 Eğer ders projesi ise ders yönergelerine uygun bir lisans/metin ekleyin.
 
 ## Notlar
-- `FedAvg_Mnist.py` basit referans olarak tutuldu.
 - Homomorfik şifreleme henüz "no-op" şeklinde; gerçek kütüphane geldiğinde `HomomorphicContext` metodlarını doldurun.
+*- Not:* Tek dosyalık örnek (`FedAvg_Mnist.py`) kaldırıldı; tüm kullanım modüler runner üzerinden yapılır.
