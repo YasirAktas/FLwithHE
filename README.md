@@ -12,6 +12,7 @@ src/
     fedavg_runner.py     # Ana çalışma scripti (modüler)
   models/
     mnist_cnn.py         # MNIST için küçük CNN
+    cifar_cnn.py         # CIFAR-10 için CNN
   he/
     encryption.py        # PlainContext ve gelecekte HE context
 config/
@@ -32,7 +33,7 @@ pip install -r requirements.txt
 ## Adım Adım Çalıştırma (Windows CMD)
 1) Proje klasörüne girin
 ```cmd
-cd C:\Users\yasir\vscodeide\FLwithHE
+cd .\FLwithHE
 ```
 
 2) (Yoksa) sanal ortam oluşturun
@@ -50,14 +51,19 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-5) Modüler runner (önerilen)
+5) Modüler runner 
 ```cmd
-python -m src.fl.fedavg_runner --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
 ```
 
-6) Non-IID (Dirichlet) veri dağılımı
+6) CIFAR-10 ile çalıştırma
 ```cmd
-python -m src.fl.fedavg_runner --num_clients 5 --rounds 5 --local_epochs 1 --partition dirichlet --dirichlet_alpha 0.3
+python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
+```
+
+7) Non-IID (Dirichlet) veri dağılımı
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --partition dirichlet --dirichlet_alpha 0.3
 ```
 Açıklama:
 - `partition=dirichlet`: Sınıf dağılımını istemciler arasında dengesiz (heterojen) yapar.
@@ -70,12 +76,12 @@ Açıklama:
 
 Örnek:
 ```cmd
-python -m src.fl.fedavg_runner --num_clients 5 --rounds 3 --no_cuda
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 3 --no_cuda
 ```
 
 8) Şifreleme kancası (şimdilik stub)
 ```cmd
-python -m src.fl.fedavg_runner --use_encryption
+python -m src.fl.fedavg_runner --dataset mnist --use_encryption
 ```
 Gerçek HE entegrasyonu sonrası `src/he/encryption.py` içindeki `HomomorphicContext` metodları doldurulacaktır.
 
@@ -85,6 +91,7 @@ Gerçek HE entegrasyonu sonrası `src/he/encryption.py` içindeki `HomomorphicCo
 - `--local_epochs`: Her istemcide epoch
 - `--batch_size`: Lokal batch boyutu
 - `--lr`: Öğrenme oranı
+- `--dataset`: `mnist` veya `cifar10`
 - `--partition`: `iid` veya `dirichlet`
 - `--dirichlet_alpha`: Non-IID şiddeti (küçükse daha heterojen)
 - `--use_encryption`: (stub) şifreli toplama modunu tetikler
@@ -109,34 +116,25 @@ deactivate
 
 ## Çalıştırma (Modüler Runner)
 ```cmd
-python -m src.fl.fedavg_runner --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
 ```
 Dirichlet (non-IID) örneği:
 ```cmd
-python -m src.fl.fedavg_runner --num_clients 5 --rounds 5 --partition dirichlet --dirichlet_alpha 0.3
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --partition dirichlet --dirichlet_alpha 0.3
+```
+CIFAR-10 örneği:
+```cmd
+python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 5 --local_epochs 1
 ```
 Encryption (şimdilik stub, gerçek HE eklenince):
 ```cmd
-python -m src.fl.fedavg_runner --use_encryption
+python -m src.fl.fedavg_runner --dataset mnist --use_encryption
 ```
 CUDA kapatmak:
 ```cmd
-python -m src.fl.fedavg_runner --no_cuda
+python -m src.fl.fedavg_runner --dataset mnist --no_cuda
 ```
 
-## Config Dosyası Kullanımı
-`config/default.yaml` içindekileri manuel parametre geçerek override edebilirsiniz. İsterseniz ileri aşamada bir `load_config` fonksiyonu ekleyip YAML dosyasını otomatik okuyabilirsiniz.
 
-## Geliştirme Yol Haritası
-1. Gerçek HE entegrasyonu (TenSEAL veya Pyfhel).
-2. Şifreli ağırlık toplama (encrypt -> add -> decrypt).
-3. İstemci tarafında gizlilik metrikleri / farklılaştırılmış gizlilik (DP) ekleme.
-4. Eğitim istatistiklerinin kaydı (CSV / TensorBoard).
-5. Testler: Küçük yapay veri ile hızlı birim test.
 
-## Lisans
-Eğer ders projesi ise ders yönergelerine uygun bir lisans/metin ekleyin.
 
-## Notlar
-- Homomorfik şifreleme henüz "no-op" şeklinde; gerçek kütüphane geldiğinde `HomomorphicContext` metodlarını doldurun.
-*- Not:* Tek dosyalık örnek (`FedAvg_Mnist.py`) kaldırıldı; tüm kullanım modüler runner üzerinden yapılır.
