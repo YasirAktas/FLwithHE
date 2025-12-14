@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from src.models.mnist_cnn import SimpleCNN
+from src.models.cifar_cnn import CifarCNN
 from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
@@ -39,13 +40,24 @@ def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.devic
     return correct / total, total_loss / total
 
 
-def build_loaders(batch_size: int):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-    ])
-    train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
-    test_ds = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+def build_loaders(batch_size: int, dataset: str):
+    if dataset == "mnist":
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ])
+        train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+        test_ds = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+    elif dataset == "cifar10":
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+        test_ds = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")
+
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
     return train_ds, test_loader
 
@@ -53,14 +65,17 @@ def build_loaders(batch_size: int):
 def run(config):
     set_seed(config.seed)
     device = torch.device("cuda" if (not config.no_cuda and torch.cuda.is_available()) else "cpu")
-    train_ds, test_loader = build_loaders(config.batch_size)
+    train_ds, test_loader = build_loaders(config.batch_size, config.dataset)
 
     if config.partition == "iid":
         partitions = iid_partitions(train_ds, config.num_clients)
     else:
         partitions = dirichlet_partitions(train_ds, config.num_clients, alpha=config.dirichlet_alpha)
 
-    global_model = SimpleCNN().to(device)
+    if config.dataset == "mnist":
+        global_model = SimpleCNN().to(device)
+    else:
+        global_model = CifarCNN().to(device)
     aggregator = Aggregator(encryption_context=PlainContext() if config.use_encryption else None)
 
     for rnd in range(1, config.rounds + 1):
@@ -85,6 +100,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--dataset", choices=["mnist", "cifar10"], default="mnist")
     p.add_argument("--partition", choices=["iid", "dirichlet"], default="iid")
     p.add_argument("--dirichlet_alpha", type=float, default=0.5)
     p.add_argument("--use_encryption", action="store_true")
