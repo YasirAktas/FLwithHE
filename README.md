@@ -12,7 +12,7 @@ src/
     fedavg_runner.py     # Ana çalışma scripti (modüler)
   models/
     mnist_cnn.py         # MNIST için küçük CNN
-    cifar_cnn.py         # CIFAR-10 için CNN
+    cifar_cnn.py         # CIFAR-10 için ResNet-18 (CIFAR'a uyarlanmış)
   he/
     encryption.py        # PlainContext ve gelecekte HE context
 config/
@@ -58,7 +58,7 @@ python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --loca
 
 6) CIFAR-10 ile çalıştırma
 ```cmd
-python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
+python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 40 --local_epochs 3 --partition iid --use_aug --weight_decay 0.0005 --scheduler cosine
 ```
 
 7) Non-IID (Dirichlet) veri dağılımı
@@ -124,7 +124,7 @@ python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --part
 ```
 CIFAR-10 örneği:
 ```cmd
-python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 5 --local_epochs 1
+python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 40 --local_epochs 3 --use_aug --weight_decay 0.0005 --scheduler cosine
 ```
 Encryption (şimdilik stub, gerçek HE eklenince):
 ```cmd
