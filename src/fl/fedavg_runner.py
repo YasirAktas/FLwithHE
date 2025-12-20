@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from src.models.mnist_cnn import SimpleCNN
-from src.models.cifar_cnn import CifarCNN
+from src.models.cifar_cnn import ResNetCIFAR10
 from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
@@ -40,7 +40,7 @@ def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.devic
     return correct / total, total_loss / total
 
 
-def build_loaders(batch_size: int, dataset: str):
+def build_loaders(batch_size: int, dataset: str, use_aug: bool = False):
     if dataset == "mnist":
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -49,12 +49,26 @@ def build_loaders(batch_size: int, dataset: str):
         train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
         test_ds = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
     elif dataset == "cifar10":
-        transform = transforms.Compose([
+        mean = (0.4914, 0.4822, 0.4465)
+        std = (0.2023, 0.1994, 0.2010)
+        if use_aug:
+            train_transform = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ])
+        else:
+            train_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ])
+        test_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            transforms.Normalize(mean, std),
         ])
-        train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-        test_ds = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+        train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=train_transform)
+        test_ds = datasets.CIFAR10(root="./data", train=False, download=True, transform=test_transform)
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
@@ -65,7 +79,7 @@ def build_loaders(batch_size: int, dataset: str):
 def run(config):
     set_seed(config.seed)
     device = torch.device("cuda" if (not config.no_cuda and torch.cuda.is_available()) else "cpu")
-    train_ds, test_loader = build_loaders(config.batch_size, config.dataset)
+    train_ds, test_loader = build_loaders(config.batch_size, config.dataset, use_aug=config.use_aug)
 
     if config.partition == "iid":
         partitions = iid_partitions(train_ds, config.num_clients)
@@ -75,7 +89,7 @@ def run(config):
     if config.dataset == "mnist":
         global_model = SimpleCNN().to(device)
     else:
-        global_model = CifarCNN().to(device)
+        global_model = ResNetCIFAR10().to(device)
     aggregator = Aggregator(encryption_context=PlainContext() if config.use_encryption else None)
 
     for rnd in range(1, config.rounds + 1):
@@ -83,7 +97,7 @@ def run(config):
         for cid, idxs in enumerate(partitions):
             subset = torch.utils.data.Subset(train_ds, idxs)
             loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
-            client = Client(cid, loader, device, lr=config.lr, momentum=0.9)
+            client = Client(cid, loader, device, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay, scheduler=config.scheduler)
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
         aggregator.federated_average(client_updates, global_model)
@@ -101,6 +115,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dataset", choices=["mnist", "cifar10"], default="mnist")
+    p.add_argument("--use_aug", action="store_true")
+    p.add_argument("--weight_decay", type=float, default=5e-4)
+    p.add_argument("--scheduler", choices=["none", "step", "cosine"], default="none")
     p.add_argument("--partition", choices=["iid", "dirichlet"], default="iid")
     p.add_argument("--dirichlet_alpha", type=float, default=0.5)
     p.add_argument("--use_encryption", action="store_true")
