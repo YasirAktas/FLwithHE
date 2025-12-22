@@ -6,13 +6,17 @@ from typing import Any
 
 class PlainContext:
     def encrypt(self, tensor):
-        return tensor  # no-op
+        return tensor
 
     def decrypt(self, tensor):
-        return tensor  # no-op
+        return tensor
 
     def add(self, a, b):
         return a + b
+
+    def mul_plain(self, a, scalar: float):
+        return a * scalar
+
 
 class HomomorphicContext:
     def __init__(self):

@@ -90,6 +90,10 @@ def run(config):
         global_model = SimpleCNN().to(device)
     else:
         global_model = ResNetCIFAR10().to(device)
+    print("\n--- ResNet keys containing layer4 or fc ---")
+    print([k for k in global_model.state_dict().keys() if "layer4" in k or "fc" in k])
+    print("------------------------------------------\n")
+
     aggregator = Aggregator(encryption_context=PlainContext() if config.use_encryption else None)
 
     for rnd in range(1, config.rounds + 1):
@@ -98,7 +102,11 @@ def run(config):
             subset = torch.utils.data.Subset(train_ds, idxs)
             loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
             client = Client(cid, loader, device, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay, scheduler=config.scheduler)
-            update = client.train(global_model, epochs=config.local_epochs)
+            update = client.train(
+                global_model,
+                epochs=config.local_epochs,
+                encryption_context=aggregator.encryption_context
+            )
             client_updates.append(update)
         aggregator.federated_average(client_updates, global_model)
         acc, loss = evaluate(global_model, test_loader, device)

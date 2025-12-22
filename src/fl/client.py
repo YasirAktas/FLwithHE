@@ -1,14 +1,21 @@
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict,Any
 
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
 @dataclass
+@dataclass
 class ClientUpdate:
-    state_dict: Dict[str, torch.Tensor]
+    plain_state: Dict[str, torch.Tensor]   # plaintext parametreler
+    enc_state: Dict[str, Any]              # şifreli parametreler (ciphertext objeleri)
     num_samples: int
+
+ENCRYPT_PREFIXES = ("model.layer4.", "model.fc.")
+
+def should_encrypt(name: str) -> bool:
+    return name.startswith(ENCRYPT_PREFIXES)
 
 class Client:
     def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none"):
@@ -20,7 +27,7 @@ class Client:
         self.weight_decay = weight_decay
         self.scheduler = scheduler
 
-    def train(self, global_model: nn.Module, epochs: int) -> ClientUpdate:
+    def train(self, global_model: nn.Module, epochs: int,  encryption_context=None) -> ClientUpdate:
         model_local = type(global_model)()  # reinstantiate architecture
         model_local.load_state_dict(global_model.state_dict())
         model_local.to(self.device)
@@ -43,4 +50,19 @@ class Client:
                 optimizer.step()
             if sched is not None:
                 sched.step()
-        return ClientUpdate(state_dict={k: v.cpu() for k, v in model_local.state_dict().items()}, num_samples=len(self.dataloader.dataset))
+        state = {k: v.detach().cpu() for k, v in model_local.state_dict().items()}
+
+        plain_state = {}
+        enc_state = {}
+
+        for k, v in state.items():
+            if should_encrypt(k) and encryption_context is not None:
+                enc_state[k] = encryption_context.encrypt(v)
+            else:
+                plain_state[k] = v
+
+        return ClientUpdate(
+            plain_state=plain_state,
+            enc_state=enc_state,
+            num_samples=len(self.dataloader.dataset),
+        )
