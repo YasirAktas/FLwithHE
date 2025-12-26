@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 from torch import nn, optim
@@ -11,7 +11,7 @@ class ClientUpdate:
     num_samples: int
 
 class Client:
-    def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none"):
+    def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None):
         self.client_id = client_id
         self.dataloader = dataloader
         self.device = device
@@ -19,6 +19,7 @@ class Client:
         self.momentum = momentum
         self.weight_decay = weight_decay
         self.scheduler = scheduler
+        self.encryption_context = encryption_context
 
     def train(self, global_model: nn.Module, epochs: int) -> ClientUpdate:
         model_local = type(global_model)()  # reinstantiate architecture
@@ -43,4 +44,7 @@ class Client:
                 optimizer.step()
             if sched is not None:
                 sched.step()
-        return ClientUpdate(state_dict={k: v.cpu() for k, v in model_local.state_dict().items()}, num_samples=len(self.dataloader.dataset))
+        sd = {k: v.cpu() for k, v in model_local.state_dict().items()}
+        if self.encryption_context is not None:
+            sd = {k: self.encryption_context.encrypt(v) for k, v in sd.items()}
+        return ClientUpdate(state_dict=sd, num_samples=len(self.dataloader.dataset))

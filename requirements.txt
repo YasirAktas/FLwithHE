@@ -3,5 +3,5 @@ torchvision
 tqdm
 pyyaml
 # Optional HE libraries (uncomment and install when needed)
-# tenseal
+tenseal
 # pyfhel

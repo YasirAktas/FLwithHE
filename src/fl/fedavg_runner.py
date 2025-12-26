@@ -1,5 +1,6 @@
 import argparse
 import random
+import time
 from typing import List
 
 import torch
@@ -7,11 +8,11 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from src.models.mnist_cnn import SimpleCNN
-from src.models.cifar_cnn import ResNetCIFAR10
+from src.models.cifar_resnet18 import ResNetCIFAR10
 from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
-from src.he.encryption import PlainContext
+from src.he.encryption import PlainContext, HomomorphicContext
 
 
 def set_seed(seed: int):
@@ -80,6 +81,8 @@ def run(config):
     set_seed(config.seed)
     device = torch.device("cuda" if (not config.no_cuda and torch.cuda.is_available()) else "cpu")
     train_ds, test_loader = build_loaders(config.batch_size, config.dataset, use_aug=config.use_aug)
+    start_time = time.time()
+    round_times = []
 
     if config.partition == "iid":
         partitions = iid_partitions(train_ds, config.num_clients)
@@ -88,21 +91,32 @@ def run(config):
 
     if config.dataset == "mnist":
         global_model = SimpleCNN().to(device)
+        encryption_ctx = HomomorphicContext() if config.use_encryption else None
     else:
         global_model = ResNetCIFAR10().to(device)
-    aggregator = Aggregator(encryption_context=PlainContext() if config.use_encryption else None)
+        # Apply HE for CIFAR-10 as well when requested
+        encryption_ctx = HomomorphicContext() if config.use_encryption else None
+    aggregator = Aggregator(encryption_context=encryption_ctx)
+    if encryption_ctx is not None:
+        print(f"[HE] Encryption: ACTIVE (dataset={config.dataset})")
+    else:
+        print("[HE] Encryption: DISABLED for this run")
 
     for rnd in range(1, config.rounds + 1):
+        round_start = time.time()
         client_updates: List = []
         for cid, idxs in enumerate(partitions):
             subset = torch.utils.data.Subset(train_ds, idxs)
             loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
-            client = Client(cid, loader, device, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay, scheduler=config.scheduler)
+            client = Client(cid, loader, device, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay, scheduler=config.scheduler, encryption_context=encryption_ctx)
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
         aggregator.federated_average(client_updates, global_model)
         acc, loss = evaluate(global_model, test_loader, device)
-        print(f"Round {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f}")
+        round_time = time.time() - round_start
+        round_times.append(round_time)
+        elapsed = time.time() - start_time
+        print(f"Round {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f} Time={round_time:.2f}s Elapsed={elapsed:.2f}s")
     return global_model
 
 
