@@ -12,7 +12,7 @@ from src.models.cifar_resnet18 import ResNetCIFAR10
 from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
-from src.he.encryption import PlainContext, HomomorphicContext
+from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
 
 
 def set_seed(seed: int):
@@ -89,16 +89,26 @@ def run(config):
     else:
         partitions = dirichlet_partitions(train_ds, config.num_clients, alpha=config.dirichlet_alpha)
 
+    # Select model and (optional) encryption scheme
     if config.dataset == "mnist":
         global_model = SimpleCNN().to(device)
-        encryption_ctx = HomomorphicContext() if config.use_encryption else None
     else:
         global_model = ResNetCIFAR10().to(device)
-        # Apply HE for CIFAR-10 as well when requested
-        encryption_ctx = HomomorphicContext() if config.use_encryption else None
+
+    if config.use_encryption:
+        scheme = getattr(config, "encryption_scheme", "ckks")
+        if scheme == "paillier":
+            encryption_ctx = PaillierContext()
+        elif scheme == "ckks":
+            encryption_ctx = HomomorphicContext()
+        else:
+            raise ValueError(f"Unknown encryption_scheme: {scheme}")
+    else:
+        encryption_ctx = None
     aggregator = Aggregator(encryption_context=encryption_ctx)
     if encryption_ctx is not None:
-        print(f"[HE] Encryption: ACTIVE (dataset={config.dataset})")
+        scheme = getattr(config, "encryption_scheme", "ckks")
+        print(f"[HE] Encryption: ACTIVE (dataset={config.dataset}, scheme={scheme})")
     else:
         print("[HE] Encryption: DISABLED for this run")
 
@@ -135,6 +145,8 @@ def parse_args():
     p.add_argument("--partition", choices=["iid", "dirichlet"], default="iid")
     p.add_argument("--dirichlet_alpha", type=float, default=0.5)
     p.add_argument("--use_encryption", action="store_true")
+    p.add_argument("--encryption_scheme", choices=["ckks", "paillier"], default="ckks",
+                   help="Which HE scheme to use when --use_encryption is set.")
     p.add_argument("--no_cuda", action="store_true")
     return p.parse_args()
 

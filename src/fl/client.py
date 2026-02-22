@@ -5,6 +5,8 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
+from src.he.encryption import PaillierContext
+
 @dataclass
 class ClientUpdate:
     state_dict: Dict[str, torch.Tensor]
@@ -46,5 +48,33 @@ class Client:
                 sched.step()
         sd = {k: v.cpu() for k, v in model_local.state_dict().items()}
         if self.encryption_context is not None:
-            sd = {k: self.encryption_context.encrypt(v) for k, v in sd.items()}
+            # PaillierContext: only encrypt the final classifier layer; keep
+            # all other parameters in plaintext to reduce overhead.
+            if isinstance(self.encryption_context, PaillierContext):
+                enc_sd: Dict[str, torch.Tensor] = {}
+                for name, tensor in sd.items():
+                    if self._is_last_layer_param(name):
+                        enc_sd[name] = self.encryption_context.encrypt(tensor)
+                    else:
+                        enc_sd[name] = tensor
+                sd = enc_sd
+            else:
+                # CKKS or other contexts: encrypt all parameters (original behavior).
+                sd = {k: self.encryption_context.encrypt(v) for k, v in sd.items()}
         return ClientUpdate(state_dict=sd, num_samples=len(self.dataloader.dataset))
+
+    def _is_last_layer_param(self, name: str) -> bool:
+        """Return True if this parameter belongs to the final classifier layer.
+
+        This covers the current architectures in the repo:
+        - SimpleCNN (MNIST): classifier[-1] is Linear -> 'classifier.3.*'
+        - ImprovedCIFAR10: final Linear named 'linear.*'
+        - ResNetCIFAR10: final Linear inside 'model.fc.*'
+        """
+        if name.startswith("classifier.3."):
+            return True
+        if name.startswith("linear."):
+            return True
+        if name.startswith("model.fc."):
+            return True
+        return False
