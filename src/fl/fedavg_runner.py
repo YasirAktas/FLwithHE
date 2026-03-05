@@ -1,6 +1,7 @@
 import argparse
 import ast
 import random
+import sys
 import time
 from typing import List
 from pathlib import Path
@@ -18,7 +19,6 @@ from src.fl.client import Client
 from src.fl.aggregator import Aggregator
 from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
 
-import os
 import subprocess
 import zipfile
 
@@ -39,7 +39,7 @@ def ensure_ptbxl_downloaded(ptbxl_root: str):
     zip_path = root / "ptb-xl-dataset.zip"
     if not zip_path.exists():
         cmd = [
-            "kaggle", "datasets", "download",
+            sys.executable, "-m", "kaggle", "datasets", "download",
             "-d", "khyeh0719/ptb-xl-dataset",
             "-p", str(root),
             "--force",
