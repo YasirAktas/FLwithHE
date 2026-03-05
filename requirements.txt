@@ -6,3 +6,7 @@ pyyaml
 tenseal
 phe  # Paillier partial HE
 # pyfhel
+numpy
+wfdb
+kaggle
+scikit-learn
