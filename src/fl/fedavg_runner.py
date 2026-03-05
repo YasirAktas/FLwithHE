@@ -1,7 +1,6 @@
 import argparse
 import ast
 import random
-import sys
 import time
 from typing import List
 from pathlib import Path
@@ -38,19 +37,37 @@ def ensure_ptbxl_downloaded(ptbxl_root: str):
     # Download zip into root
     zip_path = root / "ptb-xl-dataset.zip"
     if not zip_path.exists():
-        cmd = [
-            sys.executable, "-m", "kaggle", "datasets", "download",
-            "-d", "khyeh0719/ptb-xl-dataset",
-            "-p", str(root),
-            "--force",
-        ]
-        print("[PTB-XL] Downloading from Kaggle:", " ".join(cmd))
-        subprocess.run(cmd, check=True)
+        downloaded = False
+        try:
+            from kaggle.api.kaggle_api_extended import KaggleApi
 
-        # Kaggle names the file after the dataset slug typically; find the newest zip if name differs
-        zips = sorted(root.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if zips and zips[0] != zip_path:
-            zips[0].rename(zip_path)
+            print("[PTB-XL] Downloading from Kaggle via KaggleApi")
+            api = KaggleApi()
+            api.authenticate()
+            api.dataset_download_files(
+                "khyeh0719/ptb-xl-dataset",
+                path=str(root),
+                force=True,
+                quiet=False,
+            )
+            downloaded = True
+        except Exception as api_exc:
+            print(f"[PTB-XL] KaggleApi download failed ({api_exc}). Trying kaggle CLI...")
+            cmd = [
+                "kaggle", "datasets", "download",
+                "-d", "khyeh0719/ptb-xl-dataset",
+                "-p", str(root),
+                "--force",
+            ]
+            print("[PTB-XL] Downloading from Kaggle:", " ".join(cmd))
+            subprocess.run(cmd, check=True)
+            downloaded = True
+
+        if downloaded:
+            # Kaggle names the file after the dataset slug typically; find the newest zip if name differs
+            zips = sorted(root.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if zips and zips[0] != zip_path:
+                zips[0].rename(zip_path)
 
     # Unzip
     print(f"[PTB-XL] Extracting {zip_path} -> {root}")
