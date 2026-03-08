@@ -2,6 +2,12 @@ torch
 torchvision
 tqdm
 pyyaml
+
+# PTB-XL veri seti için
+wfdb
+pandas
+numpy
+
 # Optional HE libraries (uncomment and install when needed)
 tenseal
 phe  # Paillier partial HE

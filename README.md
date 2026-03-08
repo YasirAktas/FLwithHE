@@ -221,6 +221,87 @@ Round 01: Acc=95.12% Loss=0.1543 | Train=8.21s Encrypt=3.45s Agg=0.92s | Total=1
 - `ImportError: phe not installed`: Sanal ortam aktifken `pip install python-paillier` çalıştırın.
 - Derleme/kurulum hataları: İlgili kütüphanenin platform kılavuzunu takip edin veya geçici olarak `--use_encryption` olmadan çalıştırın.
 
+---
+
+## PTB-XL ile Çalıştırma
+
+### Adım 1 — Veri Setini İndir
+
+Tarayıcıdan şu adrese git ve ZIP dosyasını indir (~1.8 GB):
+```
+https://physionet.org/content/ptb-xl/1.0.3/
+```
+
+### Adım 2 — ZIP'i Çıkart
+
+İndirilen ZIP'i şu klasöre çıkart:
+```
+FLwithHE/data/ptbxl/
+```
+
+Sonuç şöyle görünmeli:
+```
+data/
+└── ptbxl/
+    └── ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/
+        ├── records100/
+        ├── records500/
+        ├── ptbxl_database.csv
+        └── scp_statements.csv
+```
+
+### Adım 3 — Gerekli Paketi Kur
+
+```cmd
+pip install wfdb
+```
+
+### Adım 4 — Dataset'i Test Et
+
+```cmd
+python test_ptbxl.py
+```
+
+Beklenen çıktı:
+```
+[PTBXLDataset] train: 19230 kayıt | sınıf dağılımı: {'NORM': 8314, 'MI': 3776, 'STTC': 2994, 'CD': 2971, 'HYP': 1175}
+[PTBXLDataset] test:  2158 kayıt  | sınıf dağılımı: {'NORM':  932, 'MI':  411, 'STTC':  351, 'CD':  351, 'HYP':  113}
+x shape  : torch.Size([32, 1000, 12])
+TEST BAŞARILI
+```
+
+### Adım 5 — Modeli Seç ve Çalıştır
+
+**CNN Medium (önerilen, hızlı):**
+```cmd
+python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_medium --num_clients 5 --rounds 5 --local_epochs 1
+```
+
+**CNN Large:**
+```cmd
+python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_large --num_clients 5 --rounds 5 --local_epochs 1
+```
+
+**Logistic Regression (en hızlı, baseline):**
+```cmd
+python -m src.fl.fedavg_runner --dataset ptbxl --model logistic --num_clients 5 --rounds 5 --local_epochs 1
+```
+
+**Şifreleme ile (Paillier):**
+```cmd
+python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_medium --num_clients 5 --rounds 5 --use_encryption --encryption_scheme paillier
+```
+
+### Sınıf Açıklamaları
+
+| Sınıf | Etiket | Açıklama |
+|---|---|---|
+| NORM | 0 | Normal ECG |
+| MI | 1 | Miyokard Enfarktüsü |
+| STTC | 2 | ST/T Değişikliği |
+| CD | 3 | İletim Bozukluğu |
+| HYP | 4 | Hipertrofi |
+
 
 
 
