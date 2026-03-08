@@ -80,12 +80,22 @@ python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 3 --no_c
 ```
 
 8) Homomorfik Şifreleme (HE) ile çalıştırma
+
+CKKS (varsayılan, TenSEAL tabanlı — tam model şifreleme):
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --use_encryption
+python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme ckks
 ```
+
+Paillier (python-paillier tabanlı — yalnızca son katman şifrelenir, daha hızlı):
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme paillier
+```
+
 Notlar:
 - `--use_encryption` aktifken istemci güncellemeleri HE ile şifrelenir ve sunucu tarafında ağırlıklı ortalama şifreli olarak hesaplanır; yalnızca birleştirilmiş sonuç çözülür.
-- TenSEAL kurulu olmalıdır, aksi halde ImportError alınır.
+- `ckks`: Tüm model parametrelerini şifreler. TenSEAL kurulu olmalıdır.
+- `paillier`: Yalnızca son katman (classifier) parametrelerini şifreler; diğer katmanlar düz metin kalır. `python-paillier` kurulu olmalıdır: `pip install python-paillier`.
+- Şifreleme süresi çıktıda `Encrypt=...s` olarak, aggregation süresi `Agg=...s` olarak raporlanır.
 
 10) Parametre özeti
 - `--num_clients`: İstemci sayısı
@@ -96,7 +106,8 @@ Notlar:
 - `--dataset`: `mnist` veya `cifar10`
 - `--partition`: `iid` veya `dirichlet`
 - `--dirichlet_alpha`: Non-IID şiddeti (küçükse daha heterojen)
-- `--use_encryption`: (stub) şifreli toplama modunu tetikler
+- `--use_encryption`: Şifreli toplama modunu tetikler
+- `--encryption_scheme`: `ckks` (varsayılan, TenSEAL) veya `paillier` (python-paillier)
 - `--no_cuda`: GPU kullanma
 
 11) Çıktılar
@@ -128,9 +139,13 @@ CIFAR-10 örneği:
 ```cmd
 python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 40 --local_epochs 3 --use_aug --weight_decay 0.0005 --scheduler cosine
 ```
-Encryption (HE) aktif çalıştırma:
+Encryption (HE) aktif çalıştırma — CKKS:
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --use_encryption
+python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme ckks
+```
+Encryption (HE) aktif çalıştırma — Paillier:
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme paillier
 ```
 CUDA kapatmak:
 ```cmd
@@ -140,36 +155,71 @@ python -m src.fl.fedavg_runner --dataset mnist --no_cuda
 
 
 
-## Homomorfik Şifreleme (CKKS)
+## Homomorfik Şifreleme
+
 - Amaç: İstemci ağırlık güncellemelerini gizlilik için şifreleyerek sunucunun bunları göremeden federated averaging yapması.
 - Kapsam: İstemci `state_dict` tensörleri şifrelenir; toplayıcı tarafında ağırlıklandırma (`mul_scalar`) ve toplama (`add`) şifreli yapılır; sonuç yalnızca birleşik ağırlıklı ortalama sonrası çözülür.
 
-### Kurulum (TenSEAL)
-- Windows üzerinde sanal ortamı aktifleştirdikten sonra:
+### Desteklenen Şemalar
+
+| Şema | Kütüphane | Şifrelenen Parametreler | Hız | Hassasiyet |
+|---|---|---|---|---|
+| `ckks` (varsayılan) | TenSEAL | Tüm model | Yavaş | Yaklaşık (float) |
+| `paillier` | python-paillier | Yalnızca son katman | Daha hızlı | Tam (integer) |
+
+### Kurulum
+
+CKKS için:
 ```cmd
 pip install tenseal
 ```
-- `requirements.txt` içinde TenSEAL listelidir. Kurulumda derleme gereksinimi oluşursa TenSEAL dokümantasyonundaki platform yönergelerini izleyin.
+
+Paillier için:
+```cmd
+pip install python-paillier
+```
+
+- `requirements.txt` içinde her ikisi de listelidir.
 
 ### Nasıl Etkinleştirilir?
-- Komut satırı: `--use_encryption` bayrağını ekleyin.
+
+CKKS ile:
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme ckks
+```
+
+Paillier ile (son katman şifrelemesi, daha hızlı):
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme paillier
+```
+
 - Konfigürasyon: [config/default.yaml](config/default.yaml) içinde `use_encryption: true` yapabilirsiniz.
 
 ### API Özeti
 - [src/he/encryption.py](src/he/encryption.py)
   - `PlainContext`: `encrypt(t)`, `decrypt(t)` no-op; `add(a,b)`, `mul_scalar(a,s)` düz tensör işlemleri.
   - `HomomorphicContext`: TenSEAL CKKS ile çalışır. Parametreler: `poly_modulus_degree` (varsayılan 8192), `coeff_mod_bit_sizes` (60,40,40,60), `global_scale` ($2^{40}$). CKKS slot sayısı `poly_modulus_degree/2`.
-  - İç temsil: `EncryptedTensor` şifreli ckks_vector parçalarının ve orijinal şeklin tutulduğu hafif bir kap.
+  - `PaillierContext`: python-paillier ile çalışır. Yalnızca son katman (`classifier`, `linear`, `model.fc`) parametrelerini şifreler; diğer katmanlar düz metin olarak iletilir.
+  - İç temsil: `EncryptedTensor` şifreli parçaların ve orijinal şeklin tutulduğu hafif bir kap.
+
+### Çıktıda Süre Raporlama
+
+Her round sonunda şifreleme ve aggregation süreleri ayrı ayrı gösterilir:
+```
+Round 01: Acc=95.12% Loss=0.1543 | Train=8.21s Encrypt=3.45s Agg=0.92s | Total=12.58s Elapsed=12.58s
+```
 
 ### Performans ve Sınırlamalar
 - CKKS yaklaşık aritmetik kullanır; küçük sayısal farklar beklenir.
+- Paillier tam integer aritmetik kullanır; float parametreler ölçeklenerek dönüştürülür.
 - Büyük modellerde slot parçalama nedeniyle ek bellek ve zaman maliyeti oluşur.
 - Aynı HE bağlamı (anahtarlar/ölçek) istemci ve sunucu tarafında tutarlı olmalıdır.
 - HE açıkken eğitim tur süreleri anlamlı ölçüde artabilir.
 
 ### Sorun Giderme
 - `ImportError: TenSEAL not installed`: Sanal ortam aktifken `pip install tenseal` çalıştırın.
-- Derleme/kurulum hataları: TenSEAL platform kılavuzunu takip edin veya geçici olarak `--use_encryption` olmadan çalıştırın.
+- `ImportError: phe not installed`: Sanal ortam aktifken `pip install python-paillier` çalıştırın.
+- Derleme/kurulum hataları: İlgili kütüphanenin platform kılavuzunu takip edin veya geçici olarak `--use_encryption` olmadan çalıştırın.
 
 
 

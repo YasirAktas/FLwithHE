@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import torch
@@ -11,6 +12,8 @@ from src.he.encryption import PaillierContext
 class ClientUpdate:
     state_dict: Dict[str, torch.Tensor]
     num_samples: int
+    train_time: float = 0.0
+    encrypt_time: float = 0.0
 
 class Client:
     def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None):
@@ -36,6 +39,7 @@ class Client:
         else:
             sched = None
         model_local.train()
+        train_start = time.time()
         for _ in range(epochs):
             for images, labels in self.dataloader:
                 images, labels = images.to(self.device), labels.to(self.device)
@@ -46,8 +50,11 @@ class Client:
                 optimizer.step()
             if sched is not None:
                 sched.step()
+        train_time = time.time() - train_start
         sd = {k: v.cpu() for k, v in model_local.state_dict().items()}
+        encrypt_time = 0.0
         if self.encryption_context is not None:
+            enc_start = time.time()
             # PaillierContext: only encrypt the final classifier layer; keep
             # all other parameters in plaintext to reduce overhead.
             if isinstance(self.encryption_context, PaillierContext):
@@ -61,7 +68,8 @@ class Client:
             else:
                 # CKKS or other contexts: encrypt all parameters (original behavior).
                 sd = {k: self.encryption_context.encrypt(v) for k, v in sd.items()}
-        return ClientUpdate(state_dict=sd, num_samples=len(self.dataloader.dataset))
+            encrypt_time = time.time() - enc_start
+        return ClientUpdate(state_dict=sd, num_samples=len(self.dataloader.dataset), train_time=train_time, encrypt_time=encrypt_time)
 
     def _is_last_layer_param(self, name: str) -> bool:
         """Return True if this parameter belongs to the final classifier layer.

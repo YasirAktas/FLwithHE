@@ -1,85 +1,21 @@
 import argparse
-import ast
 import random
 import time
 from typing import List
-from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from src.models.mnist_cnn import SimpleCNN
 from src.models.cifar_resnet18 import ResNetCIFAR10
-from src.models.ptbxl_cnn_medium import PTBXL_CNN_Medium
 from src.models.ptbxl_cnn_large import PTBXL_CNN_Large
+from src.models.ptbxl_cnn_medium import PTBXL_CNN_Medium
+from src.models.ptbxl_logistic import PTBXL_Logistic
 from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
 from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
-
-import subprocess
-import zipfile
-
-def ensure_ptbxl_downloaded(ptbxl_root: str):
-    """
-    Download + unzip PTB-XL from Kaggle if required files are missing.
-    Requires: kaggle CLI configured (~/.kaggle/kaggle.json).
-    """
-    root = Path(ptbxl_root).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-
-    # Your dataset wrapper searches recursively for these, so just ensure they exist somewhere under root.
-    required = ["ptbxl_database.csv", "scp_statements.csv"]
-    if all(list(root.rglob(name)) for name in required):
-        return  # already present
-
-    # Download zip into root
-    zip_path = root / "ptb-xl-dataset.zip"
-    if not zip_path.exists():
-        downloaded = False
-        try:
-            from kaggle.api.kaggle_api_extended import KaggleApi
-
-            print("[PTB-XL] Downloading from Kaggle via KaggleApi")
-            api = KaggleApi()
-            api.authenticate()
-            api.dataset_download_files(
-                "khyeh0719/ptb-xl-dataset",
-                path=str(root),
-                force=True,
-                quiet=False,
-            )
-            downloaded = True
-        except Exception as api_exc:
-            print(f"[PTB-XL] KaggleApi download failed ({api_exc}). Trying kaggle CLI...")
-            cmd = [
-                "kaggle", "datasets", "download",
-                "-d", "khyeh0719/ptb-xl-dataset",
-                "-p", str(root),
-                "--force",
-            ]
-            print("[PTB-XL] Downloading from Kaggle:", " ".join(cmd))
-            subprocess.run(cmd, check=True)
-            downloaded = True
-
-        if downloaded:
-            # Kaggle names the file after the dataset slug typically; find the newest zip if name differs
-            zips = sorted(root.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if zips and zips[0] != zip_path:
-                zips[0].rename(zip_path)
-
-    # Unzip
-    print(f"[PTB-XL] Extracting {zip_path} -> {root}")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(root)
-
-    # Final sanity check
-    if not all(list(root.rglob(name)) for name in required):
-        raise RuntimeError(
-            f"[PTB-XL] Download/extract completed but required files not found under {root}. "
-            f"Expected at least: {required}"
-        )
 
 
 def set_seed(seed: int):
@@ -108,84 +44,7 @@ def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.devic
     return correct / total, total_loss / total
 
 
-def _find_file_under_root(root: Path, filename: str) -> Path:
-    direct = root / filename
-    if direct.exists():
-        return direct
-    matches = list(root.rglob(filename))
-    if not matches:
-        raise FileNotFoundError(f"Could not find '{filename}' under {root}")
-    return matches[0]
-
-
-class PTBXLKaggleDataset(Dataset):
-    """PTB-XL dataset wrapper for Kaggle export (single-label, 5 superclass setup)."""
-
-    CLASS_ORDER = ["NORM", "MI", "STTC", "CD", "HYP"]
-
-    def __init__(self, root: str, split: str = "train", sampling_rate: int = 100):
-        try:
-            import pandas as pd
-            import wfdb
-        except ImportError as exc:
-            raise ImportError(
-                "PTB-XL support requires `pandas` and `wfdb`. "
-                "Install with: pip install pandas wfdb"
-            ) from exc
-
-        self.wfdb = wfdb
-        root_path = Path(root).expanduser().resolve()
-        db_csv = _find_file_under_root(root_path, "ptbxl_database.csv")
-        scp_csv = _find_file_under_root(root_path, "scp_statements.csv")
-        base_dir = db_csv.parent
-
-        y_df = pd.read_csv(db_csv, index_col="ecg_id")
-        agg_df = pd.read_csv(scp_csv, index_col=0)
-        diag_map = agg_df[agg_df.diagnostic == 1].diagnostic_class.to_dict()
-
-        def parse_superclasses(scp_codes_raw: str) -> List[str]:
-            scp_codes = ast.literal_eval(scp_codes_raw)
-            classes = {diag_map[code] for code in scp_codes.keys() if code in diag_map}
-            return sorted(classes)
-
-        y_df["labels"] = y_df.scp_codes.apply(parse_superclasses)
-        y_df = y_df[y_df.labels.map(len) > 0].copy()
-
-        if split == "train":
-            y_df = y_df[y_df.strat_fold <= 8]
-        elif split == "test":
-            y_df = y_df[y_df.strat_fold == 10]
-        else:
-            raise ValueError(f"Unsupported split: {split}")
-
-        class_to_idx = {label: idx for idx, label in enumerate(self.CLASS_ORDER)}
-
-        def pick_single_label(labels: List[str]) -> int:
-            for label in self.CLASS_ORDER:
-                if label in labels:
-                    return class_to_idx[label]
-            return -1
-
-        y_df["target"] = y_df.labels.apply(pick_single_label)
-        y_df = y_df[y_df.target >= 0].copy()
-
-        path_col = "filename_lr" if sampling_rate == 100 else "filename_hr"
-        self.record_paths = [(base_dir / rel_path).as_posix() for rel_path in y_df[path_col].tolist()]
-        self.targets = y_df["target"].astype(int).tolist()
-
-    def __len__(self):
-        return len(self.targets)
-
-    def __getitem__(self, idx: int):
-        signal, _ = self.wfdb.rdsamp(self.record_paths[idx])
-        x = torch.tensor(signal, dtype=torch.float32)  # [time, leads] => [1000, 12] at 100Hz
-        # Per-lead normalization improves optimization stability across clients.
-        x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
-        y = torch.tensor(self.targets[idx], dtype=torch.long)
-        return x, y
-
-
-def build_loaders(batch_size: int, dataset: str, use_aug: bool = False, ptbxl_root: str = "./data"):
+def build_loaders(batch_size: int, dataset: str, use_aug: bool = False, ptbxl_data_dir: str = None):
     if dataset == "mnist":
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -193,6 +52,7 @@ def build_loaders(batch_size: int, dataset: str, use_aug: bool = False, ptbxl_ro
         ])
         train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
         test_ds = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+        test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
     elif dataset == "cifar10":
         mean = (0.4914, 0.4822, 0.4465)
         std = (0.2023, 0.1994, 0.2010)
@@ -214,26 +74,23 @@ def build_loaders(batch_size: int, dataset: str, use_aug: bool = False, ptbxl_ro
         ])
         train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=train_transform)
         test_ds = datasets.CIFAR10(root="./data", train=False, download=True, transform=test_transform)
+        test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
     elif dataset == "ptbxl":
-        ensure_ptbxl_downloaded(ptbxl_root)
-        train_ds = PTBXLKaggleDataset(root=ptbxl_root, split="train", sampling_rate=100)
-        test_ds  = PTBXLKaggleDataset(root=ptbxl_root, split="test", sampling_rate=100)
+        from src.data.ptbxl_dataset import PTBXLDataset
+        data_dir = ptbxl_data_dir or "./data/ptbxl/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3"
+        train_ds = PTBXLDataset(data_dir=data_dir, split="train")
+        test_ds  = PTBXLDataset(data_dir=data_dir, split="test")
+        test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=0)
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
     return train_ds, test_loader
 
 
 def run(config):
     set_seed(config.seed)
     device = torch.device("cuda" if (not config.no_cuda and torch.cuda.is_available()) else "cpu")
-    train_ds, test_loader = build_loaders(
-        config.batch_size,
-        config.dataset,
-        use_aug=config.use_aug,
-        ptbxl_root=config.ptbxl_root,
-    )
+    train_ds, test_loader = build_loaders(config.batch_size, config.dataset, use_aug=config.use_aug, ptbxl_data_dir=getattr(config, "ptbxl_data_dir", None))
     start_time = time.time()
     round_times = []
 
@@ -247,11 +104,19 @@ def run(config):
         global_model = SimpleCNN().to(device)
     elif config.dataset == "cifar10":
         global_model = ResNetCIFAR10().to(device)
-    elif config.ptbxl_model == "large":
-        global_model = PTBXL_CNN_Large().to(device)
+    elif config.dataset == "ptbxl":
+        ptbxl_model = getattr(config, "ptbxl_model", "cnn_medium")
+        if ptbxl_model == "cnn_large":
+            global_model = PTBXL_CNN_Large().to(device)
+        elif ptbxl_model == "cnn_medium":
+            global_model = PTBXL_CNN_Medium().to(device)
+        elif ptbxl_model == "logistic":
+            global_model = PTBXL_Logistic().to(device)
+        else:
+            raise ValueError(f"Unknown ptbxl_model: {ptbxl_model}")
+        print(f"[PTB-XL] Model: {ptbxl_model}")
     else:
-        # "small" currently maps to medium, since no dedicated small PTB-XL CNN is defined.
-        global_model = PTBXL_CNN_Medium().to(device)
+        raise ValueError(f"Unsupported dataset: {config.dataset}")
 
     if config.use_encryption:
         scheme = getattr(config, "encryption_scheme", "ckks")
@@ -279,12 +144,20 @@ def run(config):
             client = Client(cid, loader, device, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay, scheduler=config.scheduler, encryption_context=encryption_ctx)
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
+        total_train_time  = sum(u.train_time   for u in client_updates)
+        total_encrypt_time = sum(u.encrypt_time for u in client_updates)
+        agg_start = time.time()
         aggregator.federated_average(client_updates, global_model)
+        agg_time = time.time() - agg_start
         acc, loss = evaluate(global_model, test_loader, device)
         round_time = time.time() - round_start
         round_times.append(round_time)
         elapsed = time.time() - start_time
-        print(f"Round {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f} Time={round_time:.2f}s Elapsed={elapsed:.2f}s")
+        print(
+            f"Round {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f} "
+            f"| Train={total_train_time:.2f}s Encrypt={total_encrypt_time:.2f}s "
+            f"Agg={agg_time:.2f}s | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
+        )
     return global_model
 
 
@@ -296,10 +169,12 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--dataset", choices=["mnist","cifar10","ptbxl"], default="mnist")
-    p.add_argument("--ptbxl_model",choices=["small","medium","large"], default="small")
-    p.add_argument("--ptbxl_root", type=str, default="./data/ptbxl",
-                   help="Root folder containing PTB-XL files (ptbxl_database.csv, scp_statements.csv, records*/).")
+    p.add_argument("--dataset", choices=["mnist", "cifar10", "ptbxl"], default="mnist")
+    p.add_argument("--ptbxl_model", choices=["cnn_large", "cnn_medium", "logistic"], default="cnn_medium",
+                   help="PTB-XL model seçimi (yalnızca --dataset ptbxl ile geçerli)")
+    p.add_argument("--ptbxl_data_dir", type=str,
+                   default="./data/ptbxl/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3",
+                   help="PTB-XL veri seti klasör yolu")
     p.add_argument("--use_aug", action="store_true")
     p.add_argument("--weight_decay", type=float, default=5e-4)
     p.add_argument("--scheduler", choices=["none", "step", "cosine"], default="none")

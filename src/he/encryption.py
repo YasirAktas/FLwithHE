@@ -84,7 +84,7 @@ class PaillierContext:
     scaling factor before encryption and de-quantized after decryption.
     """
 
-    def __init__(self, key_length: int = 1024, scale: float = 1e4):
+    def __init__(self, key_length: int = 2048, scale: float = 1e4):
         if paillier is None:
             raise ImportError("Paillier library 'phe' not installed. Please `pip install phe` to use PaillierContext.")
         self.public_key, self.private_key = paillier.generate_paillier_keypair(n_length=key_length)
