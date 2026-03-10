@@ -286,6 +286,7 @@ python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_large --num_clients 5
 ```cmd
 python -m src.fl.fedavg_runner --dataset ptbxl --model logistic --num_clients 5 --rounds 5 --local_epochs 1
 ```
+.\.venv\Scripts\python.exe -m src.fl.fedavg_runner --dataset ptbxl --ptbxl_model logistic --num_clients 5 --rounds 5 --local_epochs 1
 
 **Şifreleme ile (Paillier):**
 ```cmd

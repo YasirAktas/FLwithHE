@@ -12,6 +12,7 @@ from src.models.cifar_resnet18 import ResNetCIFAR10
 from src.models.ptbxl_cnn_large import PTBXL_CNN_Large
 from src.models.ptbxl_cnn_medium import PTBXL_CNN_Medium
 from src.models.ptbxl_logistic import PTBXL_Logistic
+from src.models.ptbxl_lstm import PTBXL_LSTM
 from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
@@ -112,6 +113,8 @@ def run(config):
             global_model = PTBXL_CNN_Medium().to(device)
         elif ptbxl_model == "logistic":
             global_model = PTBXL_Logistic().to(device)
+        elif ptbxl_model == "lstm":
+            global_model = PTBXL_LSTM().to(device)
         else:
             raise ValueError(f"Unknown ptbxl_model: {ptbxl_model}")
         print(f"[PTB-XL] Model: {ptbxl_model}")
@@ -170,7 +173,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dataset", choices=["mnist", "cifar10", "ptbxl"], default="mnist")
-    p.add_argument("--ptbxl_model", choices=["cnn_large", "cnn_medium", "logistic"], default="cnn_medium",
+    p.add_argument("--ptbxl_model", choices=["cnn_large", "cnn_medium", "logistic", "lstm"], default="cnn_medium",
                    help="PTB-XL model seçimi (yalnızca --dataset ptbxl ile geçerli)")
     p.add_argument("--ptbxl_data_dir", type=str,
                    default="./data/ptbxl/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3",

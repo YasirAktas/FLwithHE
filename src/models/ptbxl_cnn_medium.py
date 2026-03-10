@@ -14,7 +14,7 @@ class PTBXL_CNN_Medium(nn.Module):
 
         self.pool = nn.MaxPool1d(2)
 
-        self.fc1 = nn.Linear(32*246,64)
+        self.fc1 = nn.Linear(32*247,64)
         self.fc2 = nn.Linear(64,5)
 
     def forward(self,x):

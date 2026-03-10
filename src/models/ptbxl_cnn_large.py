@@ -15,7 +15,7 @@ class PTBXL_CNN_Large(nn.Module):
 
         self.pool = nn.MaxPool1d(2)
 
-        self.fc1 = nn.Linear(128*120,256)
+        self.fc1 = nn.Linear(128*121,256)
         self.fc2 = nn.Linear(256,64)
         self.fc3 = nn.Linear(64,5)
 

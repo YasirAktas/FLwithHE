@@ -74,15 +74,23 @@ class Client:
     def _is_last_layer_param(self, name: str) -> bool:
         """Return True if this parameter belongs to the final classifier layer.
 
-        This covers the current architectures in the repo:
-        - SimpleCNN (MNIST): classifier[-1] is Linear -> 'classifier.3.*'
-        - ImprovedCIFAR10: final Linear named 'linear.*'
-        - ResNetCIFAR10: final Linear inside 'model.fc.*'
+        python -m src.fl.fedavg_runner --dataset ptbxl --ptbxl_model logistic --num_clients 5 --rounds 5 --local_epochs 1        Desteklenen mimariler:
+        - SimpleCNN (MNIST):        son Linear → 'classifier.3.*'
+        - ResNetCIFAR10:            son Linear → 'model.fc.*'
+        - PTBXL_Logistic:           tek Linear → 'linear.*'
+        - PTBXL_CNN_Medium:         son Linear → 'fc2.*'
+        - PTBXL_CNN_Large:          son Linear → 'fc3.*'
         """
         if name.startswith("classifier.3."):
             return True
         if name.startswith("linear."):
             return True
         if name.startswith("model.fc."):
+            return True
+        if name.startswith("fc."):    # PTBXL_LSTM
+            return True
+        if name.startswith("fc2."):   # PTBXL_CNN_Medium
+            return True
+        if name.startswith("fc3."):   # PTBXL_CNN_Large
             return True
         return False
