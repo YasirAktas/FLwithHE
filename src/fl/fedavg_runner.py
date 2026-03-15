@@ -1,7 +1,10 @@
 import argparse
+import csv
+import json
+import os
 import random
 import time
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,7 +19,7 @@ from src.models.ptbxl_lstm import PTBXL_LSTM
 from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
-from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
+from src.he.encryption import HomomorphicContext, PaillierContext
 
 
 def set_seed(seed: int):
@@ -43,6 +46,193 @@ def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.devic
             correct += (pred == y).sum().item()
             total += y.size(0)
     return correct / total, total_loss / total
+
+
+def _clone_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu().clone() for k, v in state_dict.items()}
+
+
+def _plain_fedavg_state(updates: List, total_samples: int) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for key in updates[0].state_dict.keys():
+        out[key] = sum(u.state_dict[key] * (u.num_samples / total_samples) for u in updates)
+    return out
+
+
+def _parse_param_sweep(param_sweep: Optional[str]) -> List[int]:
+    if not param_sweep:
+        return []
+    vals: List[int] = []
+    for part in param_sweep.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        n = int(part)
+        if n <= 0:
+            raise ValueError("--param_sweep values must be positive integers")
+        vals.append(n)
+    return vals
+
+
+def _state_prefix_tensor(state_dict: Dict[str, torch.Tensor], n: int) -> torch.Tensor:
+    if n <= 0:
+        return torch.zeros(0, dtype=torch.float32)
+    chunks: List[torch.Tensor] = []
+    remain = n
+    for tensor in state_dict.values():
+        flat = tensor.detach().cpu().view(-1).to(torch.float32)
+        if flat.numel() == 0:
+            continue
+        take = min(remain, flat.numel())
+        chunks.append(flat[:take])
+        remain -= take
+        if remain == 0:
+            break
+    if not chunks:
+        return torch.zeros(0, dtype=torch.float32)
+    return torch.cat(chunks, dim=0)
+
+
+def _sum_payload_dicts(payloads: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for key in payloads[0].keys():
+        out[key] = sum(p[key] for p in payloads)
+    return out
+
+
+def _encrypt_payloads(payloads: List[Dict[str, torch.Tensor]], encryption_ctx) -> Tuple[List[Dict[str, object]], float, int, int, int]:
+    encrypted_payloads: List[Dict[str, object]] = []
+    total_encrypt_time = 0.0
+    ciphertext_count = 0
+    encrypted_values = 0
+    payload_nbytes = 0
+    for payload in payloads:
+        enc_payload: Dict[str, object] = {}
+        start = time.time()
+        for key, value in payload.items():
+            enc_val = encryption_ctx.encrypt(value)
+            enc_payload[key] = enc_val
+            ciphertext_count += encryption_ctx.ciphertext_count(enc_val)
+            encrypted_values += encryption_ctx.encrypted_values(enc_val)
+            payload_nbytes += encryption_ctx.payload_nbytes(enc_val)
+        total_encrypt_time += time.time() - start
+        encrypted_payloads.append(enc_payload)
+    return encrypted_payloads, total_encrypt_time, ciphertext_count, encrypted_values, payload_nbytes
+
+
+def _payload_error(reference: Dict[str, torch.Tensor], decrypted: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    diffs: List[torch.Tensor] = []
+    for key in reference.keys():
+        diffs.append((reference[key].to(torch.float32) - decrypted[key].to(torch.float32)).abs().view(-1))
+    if not diffs:
+        return 0.0, 0.0
+    all_diffs = torch.cat(diffs)
+    return float(all_diffs.mean().item()), float(all_diffs.max().item())
+
+
+def _payload_to_json(payload: Optional[Dict[str, torch.Tensor]]) -> str:
+    if payload is None:
+        return ""
+    out = {}
+    for k, v in payload.items():
+        if v.numel() == 1:
+            out[k] = float(v.view(-1)[0].item())
+        else:
+            out[k] = v.detach().cpu().view(-1).tolist()
+    return json.dumps(out, ensure_ascii=True)
+
+
+def _infer_num_classes(dataset: str) -> int:
+    if dataset in ("mnist", "cifar10"):
+        return 10
+    if dataset == "ptbxl":
+        return 5
+    raise ValueError(f"Unsupported dataset: {dataset}")
+
+
+def _compute_client_analytics(
+    global_model: torch.nn.Module,
+    local_state_dict: Dict[str, torch.Tensor],
+    dataloader: DataLoader,
+    device: torch.device,
+    include_grad_norm: bool,
+    global_before_state: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    local_model = type(global_model)().to(device)
+    local_model.load_state_dict(local_state_dict)
+    local_model.eval()
+    loss_fn = torch.nn.CrossEntropyLoss(reduction="sum")
+    loss_sum = 0.0
+    correct_count = 0.0
+    sample_count = 0.0
+    with torch.no_grad():
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            out = local_model(x)
+            loss_sum += float(loss_fn(out, y).item())
+            pred = out.argmax(1)
+            correct_count += float((pred == y).sum().item())
+            sample_count += float(y.size(0))
+
+    payload = {
+        "loss_sum": torch.tensor([loss_sum], dtype=torch.float32),
+        "correct_count": torch.tensor([correct_count], dtype=torch.float32),
+        "sample_count": torch.tensor([sample_count], dtype=torch.float32),
+    }
+    if include_grad_norm:
+        sq_norm = 0.0
+        for name, local_t in local_state_dict.items():
+            diff = local_t.to(torch.float32) - global_before_state[name].to(torch.float32)
+            sq_norm += float((diff * diff).sum().item())
+        payload["grad_norm"] = torch.tensor([sq_norm ** 0.5], dtype=torch.float32)
+    return payload
+
+
+def _compute_client_integer_stats(dataloader: DataLoader, num_classes: int) -> Dict[str, torch.Tensor]:
+    counts = torch.zeros(num_classes, dtype=torch.int64)
+    for _, y in dataloader:
+        y_cpu = y.detach().cpu()
+        if y_cpu.ndim > 1:
+            y_cpu = y_cpu.argmax(dim=1)
+        for cls in range(num_classes):
+            counts[cls] += int((y_cpu == cls).sum().item())
+    return {"class_counts": counts}
+
+
+def _append_csv_row(csv_path: str, row: Dict[str, object]):
+    fieldnames = [
+        "timestamp",
+        "round",
+        "dataset",
+        "model",
+        "num_clients",
+        "scheme",
+        "payload_mode",
+        "training_time",
+        "encrypt_time",
+        "aggregate_time",
+        "decrypt_time",
+        "he_total_time",
+        "total_round_time",
+        "ciphertext_count",
+        "encrypted_values",
+        "payload_nbytes",
+        "accuracy",
+        "loss",
+        "mean_abs_error",
+        "max_abs_error",
+        "analytics_reference",
+        "analytics_decrypted",
+        "integer_reference",
+        "integer_decrypted",
+    ]
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    write_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def build_loaders(batch_size: int, dataset: str, use_aug: bool = False, ptbxl_data_dir: str = None):
@@ -93,7 +283,11 @@ def run(config):
     device = torch.device("cuda" if (not config.no_cuda and torch.cuda.is_available()) else "cpu")
     train_ds, test_loader = build_loaders(config.batch_size, config.dataset, use_aug=config.use_aug, ptbxl_data_dir=getattr(config, "ptbxl_data_dir", None))
     start_time = time.time()
-    round_times = []
+    payload_mode = getattr(config, "payload_mode", "full_model")
+    compare_reference = bool(getattr(config, "compare_reference", False))
+    param_sweep = _parse_param_sweep(getattr(config, "param_sweep", None))
+    if param_sweep and payload_mode != "full_model":
+        raise ValueError("--param_sweep is only supported with --payload_mode full_model")
 
     if config.partition == "iid":
         partitions = iid_partitions(train_ds, config.num_clients)
@@ -124,43 +318,201 @@ def run(config):
     if config.use_encryption:
         scheme = getattr(config, "encryption_scheme", "ckks")
         if scheme == "paillier":
-            encryption_ctx = PaillierContext()
+            paillier_scale = 1.0 if payload_mode == "integer_stats" else 1e4
+            encryption_ctx = PaillierContext(scale=paillier_scale)
         elif scheme == "ckks":
             encryption_ctx = HomomorphicContext()
         else:
             raise ValueError(f"Unknown encryption_scheme: {scheme}")
     else:
         encryption_ctx = None
-    aggregator = Aggregator(encryption_context=encryption_ctx)
+    he_aggregator = Aggregator(encryption_context=encryption_ctx) if encryption_ctx is not None else None
     if encryption_ctx is not None:
         scheme = getattr(config, "encryption_scheme", "ckks")
-        print(f"[HE] Encryption: ACTIVE (dataset={config.dataset}, scheme={scheme})")
+        print(f"[HE] Encryption: ACTIVE (dataset={config.dataset}, scheme={scheme}, payload_mode={payload_mode})")
     else:
-        print("[HE] Encryption: DISABLED for this run")
+        print(f"[HE] Encryption: DISABLED (payload_mode={payload_mode})")
 
     for rnd in range(1, config.rounds + 1):
         round_start = time.time()
         client_updates: List = []
+        client_loaders: List[DataLoader] = []
+        global_before_state = _clone_state_dict(global_model.state_dict())
         for cid, idxs in enumerate(partitions):
             subset = torch.utils.data.Subset(train_ds, idxs)
             loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
-            client = Client(cid, loader, device, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay, scheduler=config.scheduler, encryption_context=encryption_ctx)
+            client = Client(cid, loader, device, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay, scheduler=config.scheduler, encryption_context=None)
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
+            client_loaders.append(loader)
         total_train_time  = sum(u.train_time   for u in client_updates)
-        total_encrypt_time = sum(u.encrypt_time for u in client_updates)
-        agg_start = time.time()
-        aggregator.federated_average(client_updates, global_model)
-        agg_time = time.time() - agg_start
+        total_samples = sum(u.num_samples for u in client_updates)
+        plain_state = _plain_fedavg_state(client_updates, total_samples)
+        plain_agg_time = time.time() - round_start - total_train_time
+
+        # Default metrics
+        encrypt_time = 0.0
+        aggregate_time = plain_agg_time
+        decrypt_time = 0.0
+        he_total_time = 0.0
+        ciphertext_count = 0
+        encrypted_values = 0
+        payload_nbytes = 0
+        mean_abs_error = 0.0
+        max_abs_error = 0.0
+        analytics_reference = ""
+        analytics_decrypted = ""
+        integer_reference = ""
+        integer_decrypted = ""
+
+        # Update global model and optional encrypted experiment path
+        if payload_mode == "full_model":
+            if encryption_ctx is not None and not param_sweep:
+                plain_payloads = [u.state_dict for u in client_updates]
+                enc_payloads, encrypt_time, ciphertext_count, encrypted_values, payload_nbytes = _encrypt_payloads(plain_payloads, encryption_ctx)
+                if getattr(encryption_ctx, "scalar_mode", None) == "int":
+                    scalars = [u.num_samples for u in client_updates]
+                    dec_state, aggregate_time, decrypt_time = he_aggregator.aggregate_encrypted_dict(enc_payloads, scalars, divide_by=float(total_samples))
+                else:
+                    scalars = [u.num_samples / total_samples for u in client_updates]
+                    dec_state, aggregate_time, decrypt_time = he_aggregator.aggregate_encrypted_dict(enc_payloads, scalars, divide_by=None)
+                global_model.load_state_dict(dec_state)
+                if compare_reference or encryption_ctx is not None:
+                    mean_abs_error, max_abs_error = _payload_error(plain_state, dec_state)
+            else:
+                global_model.load_state_dict(plain_state)
+        elif payload_mode in ("analytics", "integer_stats"):
+            # Keep FedAvg model update unchanged (plaintext), run HE experiment on side payloads.
+            global_model.load_state_dict(plain_state)
+            if payload_mode == "analytics":
+                plain_payloads = [
+                    _compute_client_analytics(
+                        global_model=global_model,
+                        local_state_dict=u.state_dict,
+                        dataloader=loader,
+                        device=device,
+                        include_grad_norm=bool(getattr(config, "analytics_include_grad_norm", False)),
+                        global_before_state=global_before_state,
+                    )
+                    for u, loader in zip(client_updates, client_loaders)
+                ]
+            else:
+                num_classes = _infer_num_classes(config.dataset)
+                plain_payloads = [_compute_client_integer_stats(loader, num_classes) for loader in client_loaders]
+
+            ref_payload = _sum_payload_dicts(plain_payloads)
+            dec_payload = ref_payload
+            if encryption_ctx is not None:
+                enc_payloads, encrypt_time, ciphertext_count, encrypted_values, payload_nbytes = _encrypt_payloads(plain_payloads, encryption_ctx)
+                one_scalars = [1 for _ in enc_payloads]
+                dec_payload, aggregate_time, decrypt_time = he_aggregator.aggregate_encrypted_dict(enc_payloads, one_scalars, divide_by=None)
+                if compare_reference or encryption_ctx is not None:
+                    mean_abs_error, max_abs_error = _payload_error(ref_payload, dec_payload)
+
+            if payload_mode == "analytics":
+                analytics_reference = _payload_to_json(ref_payload)
+                analytics_decrypted = _payload_to_json(dec_payload)
+            else:
+                integer_reference = _payload_to_json(ref_payload)
+                integer_decrypted = _payload_to_json(dec_payload)
+        else:
+            raise ValueError(f"Unknown payload_mode: {payload_mode}")
+
+        he_total_time = encrypt_time + aggregate_time + decrypt_time
         acc, loss = evaluate(global_model, test_loader, device)
         round_time = time.time() - round_start
-        round_times.append(round_time)
         elapsed = time.time() - start_time
+
+        scheme_name = getattr(config, "encryption_scheme", "none") if config.use_encryption else "none"
+        model_name = getattr(config, "ptbxl_model", "-") if config.dataset == "ptbxl" else type(global_model).__name__
+
+        # Param sweep: evaluate N-prefix encrypted payloads after normal round update.
+        if payload_mode == "full_model" and param_sweep and encryption_ctx is not None:
+            for n in param_sweep:
+                prefix_plain = [{"prefix": _state_prefix_tensor(u.state_dict, n)} for u in client_updates]
+                ref_prefix = {
+                    "prefix": sum(
+                        p["prefix"] * (u.num_samples / total_samples)
+                        for p, u in zip(prefix_plain, client_updates)
+                    )
+                }
+                enc_prefix, sw_encrypt_time, sw_ct_count, sw_enc_values, sw_nbytes = _encrypt_payloads(prefix_plain, encryption_ctx)
+                if getattr(encryption_ctx, "scalar_mode", None) == "int":
+                    scalars = [u.num_samples for u in client_updates]
+                    dec_prefix, sw_agg_time, sw_dec_time = he_aggregator.aggregate_encrypted_dict(enc_prefix, scalars, divide_by=float(total_samples))
+                else:
+                    scalars = [u.num_samples / total_samples for u in client_updates]
+                    dec_prefix, sw_agg_time, sw_dec_time = he_aggregator.aggregate_encrypted_dict(enc_prefix, scalars, divide_by=None)
+                sw_mean_err, sw_max_err = _payload_error(ref_prefix, dec_prefix)
+                sw_row = {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "round": rnd,
+                    "dataset": config.dataset,
+                    "model": model_name,
+                    "num_clients": config.num_clients,
+                    "scheme": scheme_name,
+                    "payload_mode": payload_mode,
+                    "training_time": round(total_train_time, 6),
+                    "encrypt_time": round(sw_encrypt_time, 6),
+                    "aggregate_time": round(sw_agg_time, 6),
+                    "decrypt_time": round(sw_dec_time, 6),
+                    "he_total_time": round(sw_encrypt_time + sw_agg_time + sw_dec_time, 6),
+                    "total_round_time": round(round_time, 6),
+                    "ciphertext_count": sw_ct_count,
+                    "encrypted_values": sw_enc_values,
+                    "payload_nbytes": sw_nbytes,
+                    "accuracy": round(acc, 6),
+                    "loss": round(loss, 6),
+                    "mean_abs_error": round(sw_mean_err, 8),
+                    "max_abs_error": round(sw_max_err, 8),
+                    "analytics_reference": "",
+                    "analytics_decrypted": "",
+                    "integer_reference": "",
+                    "integer_decrypted": "",
+                }
+                if config.save_metrics_csv:
+                    _append_csv_row(config.save_metrics_csv, sw_row)
+            print(
+                f"Round {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f} "
+                f"| Train={total_train_time:.2f}s Sweep={len(param_sweep)} configs "
+                f"| Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
+            )
+            continue
+
         print(
             f"Round {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f} "
-            f"| Train={total_train_time:.2f}s Encrypt={total_encrypt_time:.2f}s "
-            f"Agg={agg_time:.2f}s | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
+            f"| Train={total_train_time:.2f}s Encrypt={encrypt_time:.2f}s "
+            f"Agg={aggregate_time:.2f}s Decrypt={decrypt_time:.2f}s | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
         )
+
+        row = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "round": rnd,
+            "dataset": config.dataset,
+            "model": model_name,
+            "num_clients": config.num_clients,
+            "scheme": scheme_name,
+            "payload_mode": payload_mode,
+            "training_time": round(total_train_time, 6),
+            "encrypt_time": round(encrypt_time, 6),
+            "aggregate_time": round(aggregate_time, 6),
+            "decrypt_time": round(decrypt_time, 6),
+            "he_total_time": round(he_total_time, 6),
+            "total_round_time": round(round_time, 6),
+            "ciphertext_count": ciphertext_count,
+            "encrypted_values": encrypted_values,
+            "payload_nbytes": payload_nbytes,
+            "accuracy": round(acc, 6),
+            "loss": round(loss, 6),
+            "mean_abs_error": round(mean_abs_error, 8),
+            "max_abs_error": round(max_abs_error, 8),
+            "analytics_reference": analytics_reference,
+            "analytics_decrypted": analytics_decrypted,
+            "integer_reference": integer_reference,
+            "integer_decrypted": integer_decrypted,
+        }
+        if config.save_metrics_csv:
+            _append_csv_row(config.save_metrics_csv, row)
     return global_model
 
 
@@ -186,6 +538,11 @@ def parse_args():
     p.add_argument("--use_encryption", action="store_true")
     p.add_argument("--encryption_scheme", choices=["ckks", "paillier"], default="ckks",
                    help="Which HE scheme to use when --use_encryption is set.")
+    p.add_argument("--payload_mode", choices=["full_model", "analytics", "integer_stats"], default="full_model")
+    p.add_argument("--analytics_include_grad_norm", action="store_true")
+    p.add_argument("--param_sweep", type=str, default=None, help="Comma-separated encrypted parameter counts, e.g. 2,5,10,50")
+    p.add_argument("--save_metrics_csv", type=str, default=None)
+    p.add_argument("--compare_reference", action="store_true")
     p.add_argument("--no_cuda", action="store_true")
     return p.parse_args()
 
