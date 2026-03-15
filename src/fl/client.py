@@ -7,6 +7,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from src.he.encryption import PaillierContext
+from src.privacy.dp_utils import clip_delta
 
 @dataclass
 class ClientUpdate:
@@ -16,7 +17,7 @@ class ClientUpdate:
     encrypt_time: float = 0.0
 
 class Client:
-    def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None):
+    def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None, dp_clip_norm: Optional[float] = None):
         self.client_id = client_id
         self.dataloader = dataloader
         self.device = device
@@ -25,6 +26,7 @@ class Client:
         self.weight_decay = weight_decay
         self.scheduler = scheduler
         self.encryption_context = encryption_context
+        self.dp_clip_norm = dp_clip_norm  # DP: L2 clip normu (None → DP kapalı)
 
     def train(self, global_model: nn.Module, epochs: int) -> ClientUpdate:
         model_local = type(global_model)()  # reinstantiate architecture
@@ -52,6 +54,17 @@ class Client:
                 sched.step()
         train_time = time.time() - train_start
         sd = {k: v.cpu() for k, v in model_local.state_dict().items()}
+
+        # DP: delta hesapla, L2-clip yap, sonra global üzerine ekle
+        # Bu adım HE şifrelemesinden ÖNCE gerçekleşir.
+        if self.dp_clip_norm is not None:
+            global_sd_cpu = {k: v.cpu() for k, v in global_model.state_dict().items()}
+            delta = {k: sd[k] - global_sd_cpu[k] for k in global_sd_cpu if sd[k].is_floating_point()}
+            clipped = clip_delta(delta, self.dp_clip_norm)
+            for k in global_sd_cpu:
+                if k in clipped:
+                    sd[k] = global_sd_cpu[k] + clipped[k]
+
         encrypt_time = 0.0
         if self.encryption_context is not None:
             enc_start = time.time()

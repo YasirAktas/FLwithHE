@@ -17,6 +17,7 @@ from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
 from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
+from src.privacy.dp_utils import compute_epsilon
 
 
 def set_seed(seed: int):
@@ -121,6 +122,8 @@ def run(config):
     else:
         raise ValueError(f"Unsupported dataset: {config.dataset}")
 
+    use_dp = getattr(config, "use_dp", False)
+
     if config.use_encryption:
         scheme = getattr(config, "encryption_scheme", "ckks")
         if scheme == "paillier":
@@ -131,12 +134,43 @@ def run(config):
             raise ValueError(f"Unknown encryption_scheme: {scheme}")
     else:
         encryption_ctx = None
-    aggregator = Aggregator(encryption_context=encryption_ctx)
+    aggregator = Aggregator(
+        encryption_context=encryption_ctx,
+        dp_clip_norm=getattr(config, "dp_clip_norm", 1.0),
+        dp_noise_multiplier=getattr(config, "dp_noise_multiplier", 0.0) if use_dp else 0.0,
+    )
+    if config.use_encryption and use_dp:
+        mode = "HE+DP"
+    elif config.use_encryption:
+        mode = "HE"
+    elif use_dp:
+        mode = "DP"
+    else:
+        mode = "BASELINE"
+    print(f"[MODE] {mode}")
+
     if encryption_ctx is not None:
         scheme = getattr(config, "encryption_scheme", "ckks")
         print(f"[HE] Encryption: ACTIVE (dataset={config.dataset}, scheme={scheme})")
     else:
         print("[HE] Encryption: DISABLED for this run")
+
+    # DP durumunu ve privacy budget'ı yazdır
+    dp_clip_norm = getattr(config, "dp_clip_norm", 1.0)
+    dp_noise_multiplier = getattr(config, "dp_noise_multiplier", 0.0)
+    dp_target_delta = getattr(config, "dp_target_delta", 1e-5)
+    if use_dp:
+        epsilon = compute_epsilon(
+            noise_multiplier=dp_noise_multiplier,
+            num_rounds=config.rounds,
+            target_delta=dp_target_delta,
+        )
+        print(
+            f"[DP] ACTIVE | clip_norm={dp_clip_norm}  noise_multiplier={dp_noise_multiplier}  "
+            f"delta={dp_target_delta:.0e}  ≈ epsilon={epsilon:.4f}"
+        )
+    else:
+        print("[DP] Differential Privacy: DISABLED for this run")
 
     for rnd in range(1, config.rounds + 1):
         round_start = time.time()
@@ -144,7 +178,13 @@ def run(config):
         for cid, idxs in enumerate(partitions):
             subset = torch.utils.data.Subset(train_ds, idxs)
             loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
-            client = Client(cid, loader, device, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay, scheduler=config.scheduler, encryption_context=encryption_ctx)
+            client = Client(
+                cid, loader, device,
+                lr=config.lr, momentum=0.9, weight_decay=config.weight_decay,
+                scheduler=config.scheduler,
+                encryption_context=encryption_ctx,
+                dp_clip_norm=dp_clip_norm if use_dp else None,
+            )
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
         total_train_time  = sum(u.train_time   for u in client_updates)
@@ -186,6 +226,15 @@ def parse_args():
     p.add_argument("--use_encryption", action="store_true")
     p.add_argument("--encryption_scheme", choices=["ckks", "paillier"], default="ckks",
                    help="Which HE scheme to use when --use_encryption is set.")
+    # Differential Privacy
+    p.add_argument("--use_dp", action="store_true",
+                   help="Differential Privacy'yi etkinleştir (DP-FedAvg).")
+    p.add_argument("--dp_clip_norm", type=float, default=1.0,
+                   help="DP için L2 clip normu (varsayılan: 1.0).")
+    p.add_argument("--dp_noise_multiplier", type=float, default=0.01,
+                   help="Gaussian gürültü çarpanı sigma/S (varsayılan: 0.01). Büyüdükçe epsilon küçülür, model doğruluğu düşer.")
+    p.add_argument("--dp_target_delta", type=float, default=1e-5,
+                   help="Hedef delta değeri (varsayılan: 1e-5).")
     p.add_argument("--no_cuda", action="store_true")
     return p.parse_args()
 

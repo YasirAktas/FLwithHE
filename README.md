@@ -223,7 +223,121 @@ Round 01: Acc=95.12% Loss=0.1543 | Train=8.21s Encrypt=3.45s Agg=0.92s | Total=1
 
 ---
 
-## PTB-XL ile Çalıştırma
+## Differential Privacy (DP)
+
+Bu projede 3 ayrı çalışma modu vardır:
+- Sadece HE: `--use_encryption`
+- Sadece DP: `--use_dp`
+- HE + DP birlikte: `--use_encryption --use_dp`
+
+Yani DP, HE'den bağımsız çalışır. İlk aşamada DP'yi tek başına test edip baseline ile karşılaştırabilir, sonra aynı ayarları HE + DP modunda yeniden çalıştırabilirsin.
+
+### Genel Bakış
+
+FL + HE + DP bütünleşik akışı:
+1. **Client** — eğitim biter, `delta = local_weights − global_weights` hesapla
+2. **Client** — deltayı L2 norm ile kırp (`clip_norm`) → gizlilik "duyarlılığı" sınırlanır
+3. **Client** — HE ile şifrele (opsiyonel)
+4. **Server** — HE aggregate → decrypt → ortalama al
+5. **Server** — ortalamaya Gaussian gürültüsü ekle: `N(0, σ²)`, σ = `noise_multiplier × clip_norm / n_clients`
+6. **Server** — gürültülü modeli yayınla, privacy budget (ε) raporla
+
+### Kurulum
+
+```cmd
+pip install opendp numpy
+```
+
+### Nasıl Etkinleştirilir?
+
+Önce baseline (ne HE ne DP):
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5
+```
+
+Sadece DP:
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_dp
+```
+
+Sadece HE:
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_encryption --encryption_scheme ckks
+```
+
+DP + HE birlikte:
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_dp --use_encryption --encryption_scheme ckks
+```
+
+Daha güçlü gizlilik (büyük sigma → küçük ε, model doğruluğu düşer):
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 10 --rounds 10 --use_dp --dp_clip_norm 1.0 --dp_noise_multiplier 0.1 --dp_target_delta 1e-5
+```
+
+### Parametre Kılavuzu
+
+| Parametre | Varsayılan | Açıklama |
+|---|---|---|
+| `--use_dp` | kapalı | DP'yi etkinleştir |
+| `--dp_clip_norm` | `1.0` | L2 clip normu. Modelin tipik update norm'una göre ayarla. |
+| `--dp_noise_multiplier` | `0.01` | σ / clip_norm oranı. Büyüdükçe ε küçülür, doğruluk düşer. |
+| `--dp_target_delta` | `1e-5` | Hedef δ. Genellikle `1/veri_seti_boyutu` seçilir. |
+
+> **Önemli:** `noise_multiplier` değeri ile model doğruluğu ters orantılıdır.  
+> Az client (< 10) ve yüksek `noise_multiplier` (> 0.1) → model eğitimi bozulabilir.  
+> Makul bir başlangıç: `--dp_clip_norm 1.0 --dp_noise_multiplier 0.01`.
+
+### Konsol Çıktısı
+
+DP aktifken:
+```
+[MODE] DP
+[DP] ACTIVE | clip_norm=1.0  noise_multiplier=0.01  delta=1e-05  ≈ epsilon=10678.6140
+Round 01: Acc=92.40% Loss=0.2513 | Train=28.3s Encrypt=0.00s Agg=0.01s | Total=31.2s
+```
+
+HE + DP birlikteyken:
+```
+[MODE] HE+DP
+[HE] Encryption: ACTIVE (dataset=mnist, scheme=ckks)
+[DP] ACTIVE | clip_norm=1.0  noise_multiplier=0.01  delta=1e-05  ≈ epsilon=10678.6140
+```
+
+### Privacy–Accuracy Dengesi
+
+| noise_multiplier | σ (n=5) | Beklenen etki |
+|---|---|---|
+| `0.001` | çok küçük | Model neredeyse zarar görmez; ε büyük |
+| `0.01` | küçük | Minimal doğruluk kaybı; makul ε |
+| `0.1` | orta | Belirgin doğruluk düşüşü; güçlü gizlilik |
+| `1.0+` | büyük | Model eğitimi bozulabilir; çok küçük ε |
+
+### API Özeti
+
+- [src/privacy/dp_utils.py](src/privacy/dp_utils.py)
+  - `clip_delta(delta, clip_norm)` — model güncelleme deltasını L2 norm ile kırpar
+  - `add_gaussian_noise(state, clip_norm, noise_multiplier, num_clients)` — aggregate sonrası Gaussian gürültüsü ekler
+  - `compute_epsilon(noise_multiplier, num_rounds, target_delta)` — zCDP formülüyle ε hesaplar
+
+### Önerilen Sıralı Deney Planı
+
+1. Baseline çalıştır: ne HE ne DP açık olsun.
+2. Sadece HE çalıştır: performans ve süre etkisini ölç.
+3. Sadece DP çalıştır: accuracy ve epsilon etkisini ölç.
+4. En son HE + DP çalıştır: birleşik maliyet ve davranışı karşılaştır.
+
+Örnek seri:
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_encryption --encryption_scheme ckks
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_dp --dp_clip_norm 1.0 --dp_noise_multiplier 0.01
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_encryption --encryption_scheme ckks --use_dp --dp_clip_norm 1.0 --dp_noise_multiplier 0.01
+```
+
+---
+
+
 
 ### Adım 1 — Veri Setini İndir
 

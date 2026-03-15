@@ -2,15 +2,19 @@ from typing import List, Dict
 import torch
 
 from .client import ClientUpdate
+from src.privacy.dp_utils import privatize_aggregate_with_opendp
 
 
 class Aggregator:
-    def __init__(self, encryption_context=None):
+    def __init__(self, encryption_context=None, dp_clip_norm: float = 1.0, dp_noise_multiplier: float = 0.0):
         # encryption_context can be:
         # - None (no encryption)
         # - HomomorphicContext (CKKS, supports float scalars)
         # - PaillierContext (additive HE, integer scalars only)
         self.encryption_context = encryption_context
+        # DP: dp_noise_multiplier > 0 → DP aktif
+        self.dp_clip_norm = dp_clip_norm
+        self.dp_noise_multiplier = dp_noise_multiplier
 
     def federated_average(self, updates: List[ClientUpdate], global_model: torch.nn.Module):
         if not updates:
@@ -52,4 +56,13 @@ class Aggregator:
             else:
                 weighted = sum(u.state_dict[key] * (u.num_samples / total_samples) for u in updates)
                 new_state[key] = weighted
+        # DP: aggregate sonucu OpenDP Gaussian measurement'dan geçirilir.
+        # sigma = noise_multiplier * clip_norm / num_clients
+        if self.dp_noise_multiplier > 0.0:
+            new_state = privatize_aggregate_with_opendp(
+                new_state,
+                clip_norm=self.dp_clip_norm,
+                noise_multiplier=self.dp_noise_multiplier,
+                num_clients=len(updates),
+            )
         global_model.load_state_dict(new_state)
