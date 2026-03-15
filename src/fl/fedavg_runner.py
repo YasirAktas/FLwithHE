@@ -93,6 +93,22 @@ def _state_prefix_tensor(state_dict: Dict[str, torch.Tensor], n: int) -> torch.T
     return torch.cat(chunks, dim=0)
 
 
+def _is_last_layer_param(name: str) -> bool:
+    if name.startswith("classifier.3."):
+        return True
+    if name.startswith("linear."):
+        return True
+    if name.startswith("model.fc."):
+        return True
+    if name.startswith("fc."):
+        return True
+    if name.startswith("fc2."):
+        return True
+    if name.startswith("fc3."):
+        return True
+    return False
+
+
 def _sum_payload_dicts(payloads: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     for key in payloads[0].keys():
@@ -100,24 +116,59 @@ def _sum_payload_dicts(payloads: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
     return out
 
 
-def _encrypt_payloads(payloads: List[Dict[str, torch.Tensor]], encryption_ctx) -> Tuple[List[Dict[str, object]], float, int, int, int]:
+def _encrypt_payloads(
+    payloads: List[Dict[str, torch.Tensor]],
+    encryption_ctx,
+    debug_prefix: Optional[str] = None,
+) -> Tuple[List[Dict[str, object]], float, int, int, int]:
     encrypted_payloads: List[Dict[str, object]] = []
     total_encrypt_time = 0.0
     ciphertext_count = 0
     encrypted_values = 0
     payload_nbytes = 0
-    for payload in payloads:
+    for payload_idx, payload in enumerate(payloads, start=1):
         enc_payload: Dict[str, object] = {}
+        if debug_prefix and isinstance(encryption_ctx, PaillierContext):
+            payload_values = sum(int(v.numel()) for v in payload.values())
+            print(
+                f"{debug_prefix} encrypting client payload {payload_idx}/{len(payloads)} "
+                f"({len(payload)} tensors, {payload_values} values)"
+            )
         start = time.time()
         for key, value in payload.items():
+            if debug_prefix and isinstance(encryption_ctx, PaillierContext):
+                print(f"{debug_prefix}   tensor={key} values={value.numel()}")
             enc_val = encryption_ctx.encrypt(value)
             enc_payload[key] = enc_val
             ciphertext_count += encryption_ctx.ciphertext_count(enc_val)
             encrypted_values += encryption_ctx.encrypted_values(enc_val)
             payload_nbytes += encryption_ctx.payload_nbytes(enc_val)
         total_encrypt_time += time.time() - start
+        if debug_prefix and isinstance(encryption_ctx, PaillierContext):
+            print(
+                f"{debug_prefix} finished client payload {payload_idx}/{len(payloads)} "
+                f"in {time.time() - start:.4f}s"
+            )
         encrypted_payloads.append(enc_payload)
     return encrypted_payloads, total_encrypt_time, ciphertext_count, encrypted_values, payload_nbytes
+
+
+def _encrypt_selected_state_dicts(
+    state_dicts: List[Dict[str, torch.Tensor]],
+    encryption_ctx,
+    key_filter,
+    debug_prefix: Optional[str] = None,
+) -> Tuple[List[Dict[str, object]], float, int, int, int]:
+    selected_payloads = []
+    for state_dict in state_dicts:
+        selected_payloads.append({k: v for k, v in state_dict.items() if key_filter(k)})
+    return _encrypt_payloads(selected_payloads, encryption_ctx, debug_prefix=debug_prefix)
+
+
+def _summarize_keys(state_dict: Dict[str, torch.Tensor], key_filter) -> Tuple[List[str], int]:
+    keys = [k for k in state_dict.keys() if key_filter(k)]
+    count = sum(int(state_dict[k].numel()) for k in keys)
+    return keys, count
 
 
 def _payload_error(reference: Dict[str, torch.Tensor], decrypted: Dict[str, torch.Tensor]) -> Tuple[float, float]:
@@ -330,6 +381,8 @@ def run(config):
     if encryption_ctx is not None:
         scheme = getattr(config, "encryption_scheme", "ckks")
         print(f"[HE] Encryption: ACTIVE (dataset={config.dataset}, scheme={scheme}, payload_mode={payload_mode})")
+        if scheme == "paillier":
+            print(f"[PHE] Paillier enabled with scale={encryption_ctx.scale}")
     else:
         print(f"[HE] Encryption: DISABLED (payload_mode={payload_mode})")
 
@@ -345,6 +398,11 @@ def run(config):
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
             client_loaders.append(loader)
+            if getattr(config, "encryption_scheme", "ckks") == "paillier" and config.use_encryption:
+                print(
+                    f"[PHE][Round {rnd:02d}] client {cid} training complete "
+                    f"(samples={update.num_samples}, train_time={update.train_time:.4f}s)"
+                )
         total_train_time  = sum(u.train_time   for u in client_updates)
         total_samples = sum(u.num_samples for u in client_updates)
         plain_state = _plain_fedavg_state(client_updates, total_samples)
@@ -369,11 +427,36 @@ def run(config):
         if payload_mode == "full_model":
             if encryption_ctx is not None and not param_sweep:
                 plain_payloads = [u.state_dict for u in client_updates]
-                enc_payloads, encrypt_time, ciphertext_count, encrypted_values, payload_nbytes = _encrypt_payloads(plain_payloads, encryption_ctx)
-                if getattr(encryption_ctx, "scalar_mode", None) == "int":
+                if getattr(config, "encryption_scheme", "ckks") == "paillier":
+                    selected_keys, selected_values = _summarize_keys(plain_payloads[0], _is_last_layer_param)
+                    print(
+                        f"[PHE][Round {rnd:02d}] full_model mode: encrypting last layer only "
+                        f"({len(selected_keys)} tensors, {selected_values} values)"
+                    )
+                    print(f"[PHE][Round {rnd:02d}] encrypted tensors: {selected_keys}")
+                    enc_payloads, encrypt_time, ciphertext_count, encrypted_values, payload_nbytes = _encrypt_selected_state_dicts(
+                        plain_payloads,
+                        encryption_ctx,
+                        _is_last_layer_param,
+                        debug_prefix=f"[PHE][Round {rnd:02d}]",
+                    )
                     scalars = [u.num_samples for u in client_updates]
-                    dec_state, aggregate_time, decrypt_time = he_aggregator.aggregate_encrypted_dict(enc_payloads, scalars, divide_by=float(total_samples))
+                    print(f"[PHE][Round {rnd:02d}] starting encrypted aggregation across {len(client_updates)} clients")
+                    dec_last_layer, aggregate_time, decrypt_time = he_aggregator.aggregate_encrypted_dict(
+                        enc_payloads,
+                        scalars,
+                        divide_by=float(total_samples),
+                    )
+                    print(f"[PHE][Round {rnd:02d}] encrypted aggregation and decryption complete")
+                    dec_state = {k: v.clone() for k, v in plain_state.items()}
+                    dec_state.update(dec_last_layer)
+                    print(
+                        f"[PHE][Round {rnd:02d}] encrypt_time={encrypt_time:.4f}s "
+                        f"agg_time={aggregate_time:.4f}s decrypt_time={decrypt_time:.4f}s "
+                        f"ciphertexts={ciphertext_count} payload_nbytes={payload_nbytes}"
+                    )
                 else:
+                    enc_payloads, encrypt_time, ciphertext_count, encrypted_values, payload_nbytes = _encrypt_payloads(plain_payloads, encryption_ctx)
                     scalars = [u.num_samples / total_samples for u in client_updates]
                     dec_state, aggregate_time, decrypt_time = he_aggregator.aggregate_encrypted_dict(enc_payloads, scalars, divide_by=None)
                 global_model.load_state_dict(dec_state)
@@ -403,9 +486,30 @@ def run(config):
             ref_payload = _sum_payload_dicts(plain_payloads)
             dec_payload = ref_payload
             if encryption_ctx is not None:
-                enc_payloads, encrypt_time, ciphertext_count, encrypted_values, payload_nbytes = _encrypt_payloads(plain_payloads, encryption_ctx)
+                if getattr(config, "encryption_scheme", "ckks") == "paillier":
+                    payload_keys = list(plain_payloads[0].keys())
+                    total_values = sum(int(v.numel()) for v in plain_payloads[0].values())
+                    print(
+                        f"[PHE][Round {rnd:02d}] {payload_mode} mode: encrypting payload keys={payload_keys} "
+                        f"({total_values} values/client)"
+                    )
+                enc_payloads, encrypt_time, ciphertext_count, encrypted_values, payload_nbytes = _encrypt_payloads(
+                    plain_payloads,
+                    encryption_ctx,
+                    debug_prefix=f"[PHE][Round {rnd:02d}]" if getattr(config, "encryption_scheme", "ckks") == "paillier" else None,
+                )
                 one_scalars = [1 for _ in enc_payloads]
+                if getattr(config, "encryption_scheme", "ckks") == "paillier":
+                    print(f"[PHE][Round {rnd:02d}] starting encrypted aggregation across {len(client_updates)} clients")
                 dec_payload, aggregate_time, decrypt_time = he_aggregator.aggregate_encrypted_dict(enc_payloads, one_scalars, divide_by=None)
+                if getattr(config, "encryption_scheme", "ckks") == "paillier":
+                    print(f"[PHE][Round {rnd:02d}] encrypted aggregation and decryption complete")
+                if getattr(config, "encryption_scheme", "ckks") == "paillier":
+                    print(
+                        f"[PHE][Round {rnd:02d}] encrypt_time={encrypt_time:.4f}s "
+                        f"agg_time={aggregate_time:.4f}s decrypt_time={decrypt_time:.4f}s "
+                        f"ciphertexts={ciphertext_count} payload_nbytes={payload_nbytes}"
+                    )
                 if compare_reference or encryption_ctx is not None:
                     mean_abs_error, max_abs_error = _payload_error(ref_payload, dec_payload)
 
