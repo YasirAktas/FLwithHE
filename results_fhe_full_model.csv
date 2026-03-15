@@ -1,0 +1,6 @@
+timestamp,round,dataset,model,num_clients,scheme,payload_mode,training_time,encrypt_time,aggregate_time,decrypt_time,he_total_time,total_round_time,ciphertext_count,encrypted_values,payload_nbytes,accuracy,loss,mean_abs_error,max_abs_error,analytics_reference,analytics_decrypted,integer_reference,integer_decrypted
+2026-03-15 16:43:12,1,mnist,SimpleCNN,5,ckks,full_model,25.895533,2.495524,0.279857,0.076382,2.851763,30.428678,545,2108210,182186480,0.9539,0.161517,0.0,6e-08,,,,
+2026-03-15 16:43:40,2,mnist,SimpleCNN,5,ckks,full_model,23.947593,2.61131,0.281017,0.077202,2.969529,28.260292,545,2108210,182187391,0.9723,0.088483,0.0,6e-08,,,,
+2026-03-15 16:44:10,3,mnist,SimpleCNN,5,ckks,full_model,26.055293,2.356566,0.282712,0.076868,2.716146,30.131234,545,2108210,182183752,0.9809,0.061123,0.0,6e-08,,,,
+2026-03-15 16:44:40,4,mnist,SimpleCNN,5,ckks,full_model,25.307856,2.454168,0.284749,0.075939,2.814856,29.582553,545,2108210,182186910,0.9837,0.050233,0.0,6e-08,,,,
+2026-03-15 16:45:09,5,mnist,SimpleCNN,5,ckks,full_model,25.13953,2.565392,0.278322,0.0794,2.923114,29.531512,545,2108210,182191141,0.9866,0.041306,0.0,9e-08,,,,
