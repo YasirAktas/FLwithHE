@@ -1,4 +1,5 @@
 import argparse
+import math
 import random
 import time
 from typing import List
@@ -8,7 +9,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from src.models.mnist_cnn import SimpleCNN
-from src.models.cifar_resnet18 import ResNetCIFAR10
+from src.models.cifar_resnet18 import ResNetCIFAR10, DPResNetCIFAR10, EMAModel
 from src.models.ptbxl_cnn_large import PTBXL_CNN_Large
 from src.models.ptbxl_cnn_medium import PTBXL_CNN_Medium
 from src.models.ptbxl_logistic import PTBXL_Logistic
@@ -18,6 +19,14 @@ from src.fl.client import Client
 from src.fl.aggregator import Aggregator
 from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
 from src.privacy.dp_utils import compute_epsilon
+
+
+def warmup_cosine_lr(base_lr: float, current_round: int, total_rounds: int, warmup_rounds: int) -> float:
+    """Linear warmup for warmup_rounds, then cosine decay to 0."""
+    if current_round <= warmup_rounds:
+        return base_lr * current_round / max(1, warmup_rounds)
+    progress = (current_round - warmup_rounds) / max(1, total_rounds - warmup_rounds)
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def set_seed(seed: int):
@@ -46,7 +55,8 @@ def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.devic
     return correct / total, total_loss / total
 
 
-def build_loaders(batch_size: int, dataset: str, use_aug: bool = False, ptbxl_data_dir: str = None):
+def build_loaders(batch_size: int, dataset: str, use_aug: bool = False,
+                   autoaugment: bool = False, ptbxl_data_dir: str = None):
     if dataset == "mnist":
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -59,12 +69,16 @@ def build_loaders(batch_size: int, dataset: str, use_aug: bool = False, ptbxl_da
         mean = (0.4914, 0.4822, 0.4465)
         std = (0.2023, 0.1994, 0.2010)
         if use_aug:
-            train_transform = transforms.Compose([
+            aug_list = []
+            if autoaugment:
+                aug_list.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
+            aug_list.extend([
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
                 transforms.Normalize(mean, std),
             ])
+            train_transform = transforms.Compose(aug_list)
         else:
             train_transform = transforms.Compose([
                 transforms.ToTensor(),
@@ -89,10 +103,53 @@ def build_loaders(batch_size: int, dataset: str, use_aug: bool = False, ptbxl_da
     return train_ds, test_loader
 
 
+def _run_fl_rounds(global_model, partitions, train_ds, test_loader, device, config,
+                    aggregator, encryption_ctx, dp_clip_norm, use_dp,
+                    num_rounds, lr, label="Round", ema=None):
+    """Shared FL round loop used by both baseline/pretrain and main DP phases."""
+    results = []
+    for rnd in range(1, num_rounds + 1):
+        round_start = time.time()
+        client_updates: List = []
+        for cid, idxs in enumerate(partitions):
+            subset = torch.utils.data.Subset(train_ds, idxs)
+            loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
+            client = Client(
+                cid, loader, device,
+                lr=lr, momentum=0.9, weight_decay=config.weight_decay,
+                scheduler=config.scheduler,
+                encryption_context=encryption_ctx,
+                dp_clip_norm=dp_clip_norm if use_dp else None,
+            )
+            update = client.train(global_model, epochs=config.local_epochs)
+            client_updates.append(update)
+        aggregator.federated_average(client_updates, global_model)
+        if ema is not None:
+            ema.update(global_model)
+        acc, loss = evaluate(global_model, test_loader, device)
+        round_time = time.time() - round_start
+        results.append((rnd, acc, loss, round_time))
+        print(f"  {label} {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f} | Time={round_time:.2f}s")
+    return results
+
+
 def run(config):
     set_seed(config.seed)
     device = torch.device("cuda" if (not config.no_cuda and torch.cuda.is_available()) else "cpu")
-    train_ds, test_loader = build_loaders(config.batch_size, config.dataset, use_aug=config.use_aug, ptbxl_data_dir=getattr(config, "ptbxl_data_dir", None))
+    use_dp = getattr(config, "use_dp", False)
+
+    # Auto-enable augmentation for DP CIFAR-10
+    use_aug = config.use_aug
+    autoaugment = getattr(config, "autoaugment", False)
+    if use_dp and config.dataset == "cifar10" and not use_aug:
+        print("[DP] Augmentation auto-enabled for DP training")
+        use_aug = True
+
+    train_ds, test_loader = build_loaders(
+        config.batch_size, config.dataset, use_aug=use_aug,
+        autoaugment=autoaugment,
+        ptbxl_data_dir=getattr(config, "ptbxl_data_dir", None),
+    )
     start_time = time.time()
     round_times = []
 
@@ -101,11 +158,15 @@ def run(config):
     else:
         partitions = dirichlet_partitions(train_ds, config.num_clients, alpha=config.dirichlet_alpha)
 
-    # Select model and (optional) encryption scheme
+    # Select model — use DP-friendly variant (GroupNorm) when DP is active on CIFAR-10
     if config.dataset == "mnist":
         global_model = SimpleCNN().to(device)
     elif config.dataset == "cifar10":
-        global_model = ResNetCIFAR10().to(device)
+        if use_dp:
+            global_model = DPResNetCIFAR10().to(device)
+            print("[DP] Using DPResNetCIFAR10 (GroupNorm instead of BatchNorm)")
+        else:
+            global_model = ResNetCIFAR10().to(device)
     elif config.dataset == "ptbxl":
         ptbxl_model = getattr(config, "ptbxl_model", "cnn_medium")
         if ptbxl_model == "cnn_large":
@@ -122,8 +183,6 @@ def run(config):
     else:
         raise ValueError(f"Unsupported dataset: {config.dataset}")
 
-    use_dp = getattr(config, "use_dp", False)
-
     if config.use_encryption:
         scheme = getattr(config, "encryption_scheme", "ckks")
         if scheme == "paillier":
@@ -134,11 +193,22 @@ def run(config):
             raise ValueError(f"Unknown encryption_scheme: {scheme}")
     else:
         encryption_ctx = None
+
+    dp_clip_norm = getattr(config, "dp_clip_norm", 1.0)
+    dp_noise_multiplier = getattr(config, "dp_noise_multiplier", 0.0)
+    dp_target_delta = getattr(config, "dp_target_delta", 1e-5)
+    warmup_rounds = getattr(config, "warmup_rounds", 0)
+    use_ema = getattr(config, "use_ema", False)
+    ema_decay = getattr(config, "ema_decay", 0.999)
+    pretrain_rounds = getattr(config, "pretrain_rounds", 0)
+    baseline_compare = getattr(config, "baseline_compare", False)
+
     aggregator = Aggregator(
         encryption_context=encryption_ctx,
-        dp_clip_norm=getattr(config, "dp_clip_norm", 1.0),
-        dp_noise_multiplier=getattr(config, "dp_noise_multiplier", 0.0) if use_dp else 0.0,
+        dp_clip_norm=dp_clip_norm,
+        dp_noise_multiplier=dp_noise_multiplier if use_dp else 0.0,
     )
+
     if config.use_encryption and use_dp:
         mode = "HE+DP"
     elif config.use_encryption:
@@ -155,10 +225,6 @@ def run(config):
     else:
         print("[HE] Encryption: DISABLED for this run")
 
-    # DP durumunu ve privacy budget'ı yazdır
-    dp_clip_norm = getattr(config, "dp_clip_norm", 1.0)
-    dp_noise_multiplier = getattr(config, "dp_noise_multiplier", 0.0)
-    dp_target_delta = getattr(config, "dp_target_delta", 1e-5)
     if use_dp:
         epsilon = compute_epsilon(
             noise_multiplier=dp_noise_multiplier,
@@ -167,40 +233,159 @@ def run(config):
         )
         print(
             f"[DP] ACTIVE | clip_norm={dp_clip_norm}  noise_multiplier={dp_noise_multiplier}  "
-            f"delta={dp_target_delta:.0e}  ≈ epsilon={epsilon:.4f}"
+            f"delta={dp_target_delta:.0e}  ~ epsilon={epsilon:.4f}"
         )
+        if warmup_rounds > 0:
+            print(f"[DP] LR schedule: {warmup_rounds} warmup rounds + cosine decay over {config.rounds} rounds")
+        if pretrain_rounds > 0:
+            print(f"[DP] Pre-training {pretrain_rounds} rounds without DP noise")
     else:
         print("[DP] Differential Privacy: DISABLED for this run")
 
+    # ----------------------------------------------------------------
+    # Phase 0 (optional): Non-private baseline comparison
+    # ----------------------------------------------------------------
+    if baseline_compare and use_dp:
+        print(f"\n{'='*60}")
+        print(f"Phase 0: Non-private baseline ({config.rounds} rounds, no DP)")
+        print(f"{'='*60}")
+        rng_state = torch.get_rng_state()
+        cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        baseline_model = type(global_model)().to(device)
+        baseline_model.load_state_dict(global_model.state_dict())
+        baseline_agg = Aggregator(
+            encryption_context=encryption_ctx, dp_clip_norm=dp_clip_norm, dp_noise_multiplier=0.0,
+        )
+        baseline_results = _run_fl_rounds(
+            baseline_model, partitions, train_ds, test_loader, device, config,
+            baseline_agg, encryption_ctx, dp_clip_norm=None, use_dp=False,
+            num_rounds=config.rounds, lr=config.lr, label="Baseline",
+        )
+        baseline_acc = baseline_results[-1][1]
+        print(f"\n  >>> Non-private baseline final accuracy: {baseline_acc*100:.2f}%")
+        del baseline_model, baseline_agg
+        torch.set_rng_state(rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+
+    # ----------------------------------------------------------------
+    # EMA initialization
+    # ----------------------------------------------------------------
+    ema = None
+    if use_ema and use_dp:
+        ema = EMAModel(global_model, decay=ema_decay)
+        print(f"[EMA] Enabled with decay={ema_decay}")
+
+    # ----------------------------------------------------------------
+    # Phase 1 (optional): Non-private pretraining
+    # ----------------------------------------------------------------
+    if pretrain_rounds > 0 and use_dp:
+        print(f"\n{'='*60}")
+        print(f"Phase 1: Non-private pretraining ({pretrain_rounds} rounds)")
+        print(f"{'='*60}")
+        pretrain_agg = Aggregator(
+            encryption_context=encryption_ctx, dp_clip_norm=dp_clip_norm, dp_noise_multiplier=0.0,
+        )
+        _run_fl_rounds(
+            global_model, partitions, train_ds, test_loader, device, config,
+            pretrain_agg, encryption_ctx, dp_clip_norm=None, use_dp=False,
+            num_rounds=pretrain_rounds, lr=config.lr, label="Pretrain",
+        )
+        del pretrain_agg
+        if ema is not None:
+            ema = EMAModel(global_model, decay=ema_decay)
+        print()
+
+    # ----------------------------------------------------------------
+    # Phase 2: Main training loop (with DP if enabled)
+    # ----------------------------------------------------------------
+    if pretrain_rounds > 0 and use_dp:
+        print(f"{'='*60}")
+        print(f"Phase 2: DP training ({config.rounds} rounds)")
+        print(f"{'='*60}")
+
     for rnd in range(1, config.rounds + 1):
         round_start = time.time()
+
+        # Warmup + cosine LR across rounds
+        if use_dp and warmup_rounds > 0:
+            current_lr = warmup_cosine_lr(config.lr, rnd, config.rounds, warmup_rounds)
+        else:
+            current_lr = config.lr
+
         client_updates: List = []
         for cid, idxs in enumerate(partitions):
             subset = torch.utils.data.Subset(train_ds, idxs)
             loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
             client = Client(
                 cid, loader, device,
-                lr=config.lr, momentum=0.9, weight_decay=config.weight_decay,
+                lr=current_lr, momentum=0.9, weight_decay=config.weight_decay,
                 scheduler=config.scheduler,
                 encryption_context=encryption_ctx,
                 dp_clip_norm=dp_clip_norm if use_dp else None,
             )
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
-        total_train_time  = sum(u.train_time   for u in client_updates)
+
+        total_train_time = sum(u.train_time for u in client_updates)
         total_encrypt_time = sum(u.encrypt_time for u in client_updates)
         agg_start = time.time()
         aggregator.federated_average(client_updates, global_model)
         agg_time = time.time() - agg_start
-        acc, loss = evaluate(global_model, test_loader, device)
+
+        if ema is not None:
+            ema.update(global_model)
+
+        # Evaluate — prefer EMA model when available
+        ema_str = ""
+        if ema is not None:
+            ema_model_eval = type(global_model)().to(device)
+            ema.apply_to(ema_model_eval)
+            acc, loss = evaluate(ema_model_eval, test_loader, device)
+            raw_acc, _ = evaluate(global_model, test_loader, device)
+            ema_str = f" (raw={raw_acc*100:.2f}%)"
+            del ema_model_eval
+        else:
+            acc, loss = evaluate(global_model, test_loader, device)
+
         round_time = time.time() - round_start
         round_times.append(round_time)
         elapsed = time.time() - start_time
+
+        # Per-round privacy budget
+        eps_str = ""
+        if use_dp:
+            round_eps = compute_epsilon(
+                noise_multiplier=dp_noise_multiplier,
+                num_rounds=rnd,
+                target_delta=dp_target_delta,
+            )
+            eps_str = f" eps={round_eps:.4f}"
+
+        lr_str = f" LR={current_lr:.6f}" if use_dp and warmup_rounds > 0 else ""
+
         print(
-            f"Round {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f} "
+            f"Round {rnd:02d}: Acc={acc*100:.2f}%{ema_str} Loss={loss:.4f}{eps_str}{lr_str} "
             f"| Train={total_train_time:.2f}s Encrypt={total_encrypt_time:.2f}s "
             f"Agg={agg_time:.2f}s | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
         )
+
+    # ----------------------------------------------------------------
+    # Summary
+    # ----------------------------------------------------------------
+    if use_dp:
+        final_eps = compute_epsilon(
+            noise_multiplier=dp_noise_multiplier,
+            num_rounds=config.rounds,
+            target_delta=dp_target_delta,
+        )
+        print(f"\n[DP Summary] Final epsilon={final_eps:.4f}, delta={dp_target_delta:.0e}")
+        if ema is not None:
+            print(f"[EMA] Final EMA accuracy: {acc*100:.2f}%")
+
+    if ema is not None:
+        ema.apply_to(global_model)
+
     return global_model
 
 
@@ -226,6 +411,8 @@ def parse_args():
     p.add_argument("--use_encryption", action="store_true")
     p.add_argument("--encryption_scheme", choices=["ckks", "paillier"], default="ckks",
                    help="Which HE scheme to use when --use_encryption is set.")
+    p.add_argument("--autoaugment", action="store_true",
+                   help="CIFAR-10 AutoAugment policy (use_aug ile birlikte).")
     # Differential Privacy
     p.add_argument("--use_dp", action="store_true",
                    help="Differential Privacy'yi etkinleştir (DP-FedAvg).")
@@ -235,6 +422,17 @@ def parse_args():
                    help="Gaussian gürültü çarpanı sigma/S (varsayılan: 0.01). Büyüdükçe epsilon küçülür, model doğruluğu düşer.")
     p.add_argument("--dp_target_delta", type=float, default=1e-5,
                    help="Hedef delta değeri (varsayılan: 1e-5).")
+    # DP accuracy improvements
+    p.add_argument("--warmup_rounds", type=int, default=0,
+                   help="Linear LR warmup round sayısı; ardından cosine decay uygulanır.")
+    p.add_argument("--use_ema", action="store_true",
+                   help="EMA (Exponential Moving Average) ile DP gürültüsünü yumuşat.")
+    p.add_argument("--ema_decay", type=float, default=0.999,
+                   help="EMA decay oranı (varsayılan: 0.999).")
+    p.add_argument("--pretrain_rounds", type=int, default=0,
+                   help="DP öncesi non-private ön-eğitim round sayısı.")
+    p.add_argument("--baseline_compare", action="store_true",
+                   help="DP çalıştırmadan önce non-private baseline ölç.")
     p.add_argument("--no_cuda", action="store_true")
     return p.parse_args()
 
