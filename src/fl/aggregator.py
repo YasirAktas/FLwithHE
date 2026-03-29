@@ -2,24 +2,24 @@ from typing import List, Dict
 import torch
 
 from .client import ClientUpdate
-from src.privacy.dp_utils import privatize_aggregate_with_opendp
-
 
 class Aggregator:
-    def __init__(self, encryption_context=None, dp_clip_norm: float = 1.0, dp_noise_multiplier: float = 0.0):
+    def __init__(
+        self,
+        encryption_context=None,
+    ):
         # encryption_context can be:
         # - None (no encryption)
         # - HomomorphicContext (CKKS, supports float scalars)
         # - PaillierContext (additive HE, integer scalars only)
         self.encryption_context = encryption_context
-        # DP: dp_noise_multiplier > 0 → DP aktif
-        self.dp_clip_norm = dp_clip_norm
-        self.dp_noise_multiplier = dp_noise_multiplier
 
     def federated_average(self, updates: List[ClientUpdate], global_model: torch.nn.Module):
         if not updates:
             return
+        is_model_delta = all(u.is_model_delta for u in updates)
         total_samples = sum(u.num_samples for u in updates)
+        base_state = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
         new_state: Dict[str, torch.Tensor] = {}
         for key in updates[0].state_dict.keys():
             if self.encryption_context:
@@ -56,13 +56,12 @@ class Aggregator:
             else:
                 weighted = sum(u.state_dict[key] * (u.num_samples / total_samples) for u in updates)
                 new_state[key] = weighted
-        # DP: aggregate sonucu OpenDP Gaussian measurement'dan geçirilir.
-        # sigma = noise_multiplier * clip_norm / num_clients
-        if self.dp_noise_multiplier > 0.0:
-            new_state = privatize_aggregate_with_opendp(
-                new_state,
-                clip_norm=self.dp_clip_norm,
-                noise_multiplier=self.dp_noise_multiplier,
-                num_clients=len(updates),
-            )
+        if is_model_delta:
+            updated_state: Dict[str, torch.Tensor] = {}
+            for key, value in base_state.items():
+                if key in new_state and value.is_floating_point():
+                    updated_state[key] = value + new_state[key]
+                else:
+                    updated_state[key] = value
+            new_state = updated_state
         global_model.load_state_dict(new_state)

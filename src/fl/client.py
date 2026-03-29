@@ -1,5 +1,6 @@
 import time
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
@@ -7,7 +8,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from src.he.encryption import PaillierContext
-from src.privacy.dp_utils import clip_delta
+from src.privacy.dp_utils import clip_and_gaussian_noise_delta, clip_and_laplace_noise_delta
 
 @dataclass
 class ClientUpdate:
@@ -15,9 +16,16 @@ class ClientUpdate:
     num_samples: int
     train_time: float = 0.0
     encrypt_time: float = 0.0
+    is_model_delta: bool = False
+    raw_update_norm: float = 0.0
+    clipped_update_norm: float = 0.0
+    clipping_factor: float = 1.0
+    gaussian_std: float = 0.0
+    laplace_scale: float = 0.0
+    laplace_expected_noise_l2: float = 0.0
 
 class Client:
-    def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None, dp_clip_norm: Optional[float] = None):
+    def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None, dp_clip_norm: Optional[float] = None, dp_noise_multiplier: float = 0.0, dp_mechanism: str = "gaussian", dp_laplace_epsilon_per_round: float = 0.0):
         self.client_id = client_id
         self.dataloader = dataloader
         self.device = device
@@ -27,6 +35,9 @@ class Client:
         self.scheduler = scheduler
         self.encryption_context = encryption_context
         self.dp_clip_norm = dp_clip_norm  # DP: L2 clip normu (None → DP kapalı)
+        self.dp_noise_multiplier = dp_noise_multiplier
+        self.dp_mechanism = dp_mechanism
+        self.dp_laplace_epsilon_per_round = dp_laplace_epsilon_per_round
 
     def train(self, global_model: nn.Module, epochs: int) -> ClientUpdate:
         model_local = type(global_model)()  # reinstantiate architecture
@@ -54,16 +65,38 @@ class Client:
                 sched.step()
         train_time = time.time() - train_start
         sd = {k: v.cpu() for k, v in model_local.state_dict().items()}
+        raw_update_norm = 0.0
+        clipped_update_norm = 0.0
+        clipping_factor = 1.0
+        gaussian_std = 0.0
+        laplace_scale = 0.0
+        laplace_expected_noise_l2 = 0.0
+        is_model_delta = False
 
-        # DP: delta hesapla, L2-clip yap, sonra global üzerine ekle
-        # Bu adım HE şifrelemesinden ÖNCE gerçekleşir.
-        if self.dp_clip_norm is not None:
+        # DP is applied to the transmitted client update delta, not to full model states.
+        if self.dp_clip_norm is not None and self.dp_mechanism in {"gaussian", "laplace"}:
             global_sd_cpu = {k: v.cpu() for k, v in global_model.state_dict().items()}
             delta = {k: sd[k] - global_sd_cpu[k] for k in global_sd_cpu if sd[k].is_floating_point()}
-            clipped = clip_delta(delta, self.dp_clip_norm)
-            for k in global_sd_cpu:
-                if k in clipped:
-                    sd[k] = global_sd_cpu[k] + clipped[k]
+            if self.dp_mechanism == "gaussian":
+                sd, raw_update_norm, clipped_update_norm, clipping_factor, gaussian_std = clip_and_gaussian_noise_delta(
+                    delta,
+                    clip_norm=self.dp_clip_norm,
+                    noise_multiplier=self.dp_noise_multiplier,
+                )
+            else:
+                sd, raw_update_norm, clipped_update_norm, clipping_factor, laplace_scale = clip_and_laplace_noise_delta(
+                    delta,
+                    clip_norm=self.dp_clip_norm,
+                    epsilon=self.dp_laplace_epsilon_per_round,
+                )
+                dim = sum(v.numel() for v in sd.values() if v.is_floating_point())
+                # For iid Laplace(0, b), E||noise||_2 is on the order of sqrt(2 * d) * b.
+                laplace_expected_noise_l2 = math.sqrt(2.0 * float(dim)) * laplace_scale if dim > 0 else 0.0
+            sd = {
+                key: torch.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+                for key, value in sd.items()
+            }
+            is_model_delta = True
 
         encrypt_time = 0.0
         if self.encryption_context is not None:
@@ -82,7 +115,19 @@ class Client:
                 # CKKS or other contexts: encrypt all parameters (original behavior).
                 sd = {k: self.encryption_context.encrypt(v) for k, v in sd.items()}
             encrypt_time = time.time() - enc_start
-        return ClientUpdate(state_dict=sd, num_samples=len(self.dataloader.dataset), train_time=train_time, encrypt_time=encrypt_time)
+        return ClientUpdate(
+            state_dict=sd,
+            num_samples=len(self.dataloader.dataset),
+            train_time=train_time,
+            encrypt_time=encrypt_time,
+            is_model_delta=is_model_delta,
+            raw_update_norm=raw_update_norm,
+            clipped_update_norm=clipped_update_norm,
+            clipping_factor=clipping_factor,
+            gaussian_std=gaussian_std,
+            laplace_scale=laplace_scale,
+            laplace_expected_noise_l2=laplace_expected_noise_l2,
+        )
 
     def _is_last_layer_param(self, name: str) -> bool:
         """Return True if this parameter belongs to the final classifier layer.

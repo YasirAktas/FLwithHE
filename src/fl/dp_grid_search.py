@@ -52,8 +52,6 @@ def run_single(sigma: float, clip_norm: float, config) -> dict:
 
     aggregator = Aggregator(
         encryption_context=None,
-        dp_clip_norm=clip_norm,
-        dp_noise_multiplier=sigma,
     )
 
     best_acc = 0.0
@@ -67,6 +65,8 @@ def run_single(sigma: float, clip_norm: float, config) -> dict:
                 lr=config.lr, momentum=0.9, weight_decay=config.weight_decay,
                 scheduler="none", encryption_context=None,
                 dp_clip_norm=clip_norm,
+                dp_noise_multiplier=sigma,
+                dp_mechanism="gaussian",
             )
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
