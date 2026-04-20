@@ -275,6 +275,12 @@ def apply_dp_sgd(
     device: Optional[torch.device] = None,
     debug: bool = False,
     debug_prefix: str = "",
+    clip_strategy: str = "fixed",
+    clip_quantile: float = 50.0,
+    clip_alpha: float = 0.9,
+    clip_min: float = 0.1,
+    clip_max: float = 10.0,
+    clip_state: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """
     Apply per-example DP-SGD during local training.
@@ -310,12 +316,15 @@ def apply_dp_sgd(
     clipped_norm_sum = 0.0
     noise_norm_sum = 0.0
     noise_scale_sum = 0.0
+    clip_norm_sum = 0.0
+    clip_factor_sum = 0.0
     steps = 0
 
     norm_type = 2 if mechanism == "gaussian" else 1
     for batch_idx, (inputs, targets) in enumerate(data_loader, start=1):
         inputs, targets = inputs.to(device), targets.to(device)
         batch_size = targets.size(0)
+        flat_grads: List[torch.Tensor] = []
         clipped_grads: List[torch.Tensor] = []
         raw_norms: List[float] = []
         clipped_norms: List[float] = []
@@ -343,21 +352,57 @@ def apply_dp_sgd(
             if metadata is None:
                 metadata = sample_metadata
             assert_finite_tensor(f"{debug_prefix}grad_i_before_clipping", flat_grad)
-            clipped_grad, raw_norm, clipped_norm, clip_factor = clip_update(
+            raw_norm = flat_grad.norm(p=norm_type).item()
+            flat_grads.append(flat_grad)
+            raw_norms.append(raw_norm)
+            batch_loss_sum += loss.item()
+
+        if not flat_grads or metadata is None:
+            optimizer.zero_grad()
+            continue
+
+        clip_norm_eff = float(clip_norm)
+        if clip_strategy in {"quantile", "adaptive"}:
+            # Clipping defines sensitivity in DP. Instead of a fixed value,
+            # quantile clipping tracks the actual per-example gradient norm
+            # distribution; adaptive smoothing follows training dynamics and
+            # reduces manual tuning without changing the DP mechanism.
+            norms_t = torch.tensor(raw_norms, dtype=torch.float64)
+            q = max(0.0, min(float(clip_quantile), 100.0)) / 100.0
+            clip_norm_current = float(torch.quantile(norms_t, q).item())
+            if clip_strategy == "adaptive":
+                if clip_state is None:
+                    clip_state = {}
+                if "running" not in clip_state:
+                    clip_state["running"] = clip_norm_current
+                clip_state["running"] = (
+                    float(clip_alpha) * float(clip_state["running"]) +
+                    (1.0 - float(clip_alpha)) * clip_norm_current
+                )
+                clip_norm_eff = float(clip_state["running"])
+            else:
+                clip_norm_eff = clip_norm_current
+                if clip_state is not None:
+                    clip_state["running"] = clip_norm_eff
+            clip_norm_eff = max(float(clip_min), min(clip_norm_eff, float(clip_max)))
+            if clip_state is not None:
+                clip_state["running"] = clip_norm_eff
+            print("[ADAPTIVE CLIP][DP-SGD]")
+            print("  quantile clip:", clip_norm_current)
+            print("  running clip:", clip_norm_eff)
+            print("  min norm:", min(raw_norms))
+            print("  max norm:", max(raw_norms))
+
+        for flat_grad in flat_grads:
+            clipped_grad, _raw_norm, clipped_norm, clip_factor = clip_update(
                 flat_grad,
-                clip_norm=clip_norm,
+                clip_norm=clip_norm_eff,
                 norm_type=norm_type,
             )
             assert_finite_tensor(f"{debug_prefix}grad_i_after_clipping", clipped_grad)
             clipped_grads.append(clipped_grad)
-            raw_norms.append(raw_norm)
             clipped_norms.append(clipped_norm)
             clip_factors.append(clip_factor)
-            batch_loss_sum += loss.item()
-
-        if not clipped_grads or metadata is None:
-            optimizer.zero_grad()
-            continue
 
         stacked_grads = torch.stack(clipped_grads, dim=0)
         averaged_grad = stacked_grads.mean(dim=0)
@@ -366,7 +411,7 @@ def apply_dp_sgd(
         # Noise is added after averaging, so the sensitivity of the averaged
         # clipped gradient is clip_norm / batch_size. For Gaussian this is L2
         # sensitivity; for Laplace the per-example gradients were clipped in L1.
-        averaged_sensitivity = float(clip_norm) / float(batch_size)
+        averaged_sensitivity = float(clip_norm_eff) / float(batch_size)
         if mechanism == "gaussian":
             noise_scale = gaussian_noise_scale(epsilon=epsilon, delta=delta, clip_norm=averaged_sensitivity)
         else:
@@ -383,6 +428,7 @@ def apply_dp_sgd(
             print(f"{step_prefix}Per-example DP-SGD gradient stats:")
             print("  norm_type:", "L2" if norm_type == 2 else "L1")
             print("  batch_size:", batch_size)
+            print("  clip_norm_eff:", clip_norm_eff)
             print("  raw_grad_norm_mean:", sum(raw_norms) / len(raw_norms))
             print("  raw_grad_norm_max:", max(raw_norms))
             print("  clipped_grad_norm_mean:", sum(clipped_norms) / len(clipped_norms))
@@ -398,8 +444,10 @@ def apply_dp_sgd(
         total_samples += batch_size
         grad_norm_sum += sum(raw_norms) / len(raw_norms)
         clipped_norm_sum += sum(clipped_norms) / len(clipped_norms)
+        clip_factor_sum += sum(clip_factors) / len(clip_factors)
         noise_norm_sum += torch.norm(noise).item()
         noise_scale_sum += noise_scale
+        clip_norm_sum += clip_norm_eff
         steps += 1
 
     return {
@@ -408,6 +456,8 @@ def apply_dp_sgd(
         "clipped_norm": clipped_norm_sum / max(steps, 1),
         "noise_norm": noise_norm_sum / max(steps, 1),
         "noise_scale": noise_scale_sum / max(steps, 1),
+        "clip_norm": clip_norm_sum / max(steps, 1),
+        "clip_factor": clip_factor_sum / max(steps, 1),
         "steps": float(steps),
     }
 

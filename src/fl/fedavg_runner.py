@@ -5,6 +5,7 @@ import random
 import time
 from typing import List
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -17,9 +18,10 @@ from src.models.ptbxl_logistic import PTBXL_Logistic
 from src.models.ptbxl_lstm import PTBXL_LSTM
 from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
+from src.fl.client import ClientUpdate
 from src.fl.aggregator import Aggregator
 from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
-from src.privacy.dp_utils import compute_laplace_epsilon, gaussian_noise_scale, laplace_noise_scale
+from src.privacy.dp_utils import compute_laplace_epsilon, flatten_state_update, gaussian_noise_scale, laplace_noise_scale, privatize_update_delta
 
 
 def warmup_cosine_lr(base_lr: float, current_round: int, total_rounds: int, warmup_rounds: int) -> float:
@@ -54,6 +56,87 @@ def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.devic
             correct += (pred == y).sum().item()
             total += y.size(0)
     return correct / total, total_loss / total
+
+
+def _client_update_norm(update: ClientUpdate) -> float:
+    flat_update, _metadata = flatten_state_update(update.state_dict)
+    if flat_update.numel() == 0:
+        return 0.0
+    return flat_update.norm(p=2).item()
+
+
+def _compute_adaptive_clip_norm(config, norms: List[float], default_clip_norm: float) -> float:
+    """
+    Clipping defines the sensitivity used by the DP mechanism.
+
+    Instead of using one fixed manual value, quantile clipping tracks the actual
+    client update norm distribution. Adaptive smoothing then follows training
+    dynamics across rounds, which prevents persistent over-clipping and reduces
+    manual tuning. This improves signal strength but does not remove
+    high-dimensional DP noise, so accuracy gains are limited by epsilon and d.
+    """
+    if not norms:
+        return default_clip_norm
+
+    q = float(getattr(config, "dp_clip_quantile", 50.0))
+    alpha = float(getattr(config, "dp_clip_alpha", 0.9))
+    min_clip = float(getattr(config, "dp_clip_min", 0.1))
+    max_clip = float(getattr(config, "dp_clip_max", 10.0))
+
+    clip_norm_current = float(np.percentile(np.asarray(norms, dtype=np.float64), q))
+    strategy = getattr(config, "dp_clip_strategy", "adaptive")
+    if strategy == "adaptive":
+        if not hasattr(config, "clip_norm_running"):
+            config.clip_norm_running = clip_norm_current
+        config.clip_norm_running = alpha * float(config.clip_norm_running) + (1.0 - alpha) * clip_norm_current
+        clip_norm = float(config.clip_norm_running)
+    else:
+        config.clip_norm_running = clip_norm_current
+        clip_norm = clip_norm_current
+
+    clip_norm = max(min_clip, min(clip_norm, max_clip))
+    config.clip_norm_running = clip_norm
+
+    print("[ADAPTIVE CLIP]")
+    print("  quantile clip:", clip_norm_current)
+    print("  running clip:", config.clip_norm_running)
+    print("  min norm:", min(norms))
+    print("  max norm:", max(norms))
+    return clip_norm
+
+
+def _apply_client_level_dp_after_adaptive_clip(
+    client_updates: List[ClientUpdate],
+    mechanism: str,
+    epsilon: float,
+    delta: float,
+    clip_norm: float,
+    debug: bool,
+) -> None:
+    for update in client_updates:
+        privatized, raw_norm, clipped_norm, clip_factor, noise_scale, noise_norm, ratio = privatize_update_delta(
+            update.state_dict,
+            mechanism=mechanism,
+            epsilon=epsilon,
+            delta_value=delta,
+            clip_norm=clip_norm,
+            debug=debug,
+            debug_prefix="[DP DEBUG][adaptive client-level] ",
+        )
+        update.state_dict = privatized
+        update.is_model_delta = True
+        update.raw_update_norm = raw_norm
+        update.clipped_update_norm = clipped_norm
+        update.clipping_factor = clip_factor
+        update.noise_scale = noise_scale
+        update.noise_norm = noise_norm
+        update.signal_noise_ratio = ratio
+        if mechanism == "gaussian":
+            update.gaussian_std = noise_scale
+        else:
+            update.laplace_scale = noise_scale
+            dim = sum(v.numel() for v in privatized.values() if v.is_floating_point())
+            update.laplace_expected_noise_l2 = math.sqrt(2.0 * float(dim)) * noise_scale if dim > 0 else 0.0
 
 
 def build_loaders(batch_size: int, dataset: str, use_aug: bool = False,
@@ -110,6 +193,7 @@ def _run_fl_rounds(global_model, partitions, train_ds, test_loader, device, conf
     """Shared FL round loop used by both baseline/pretrain and main DP phases."""
     dp_mode = getattr(config, "dp_mode", "client_level")
     dp_mechanism = getattr(config, "dp_mechanism", "gaussian")
+    dp_clip_strategy = getattr(config, "dp_clip_strategy", "adaptive")
     dp_noise_multiplier = getattr(config, "dp_noise_multiplier", 0.0)
     dp_epsilon = getattr(config, "dp_epsilon", 1.0)
     dp_laplace_epsilon = getattr(config, "dp_laplace_epsilon", 5.0)
@@ -121,6 +205,7 @@ def _run_fl_rounds(global_model, partitions, train_ds, test_loader, device, conf
     for rnd in range(1, num_rounds + 1):
         round_start = time.time()
         client_updates: List = []
+        adaptive_client_clip = use_dp and dp_mode == "client_level" and dp_clip_strategy in {"quantile", "adaptive"}
         for cid, idxs in enumerate(partitions):
             subset = torch.utils.data.Subset(train_ds, idxs)
             loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
@@ -129,7 +214,7 @@ def _run_fl_rounds(global_model, partitions, train_ds, test_loader, device, conf
                 lr=lr, momentum=0.9, weight_decay=config.weight_decay,
                 scheduler=config.scheduler,
                 encryption_context=encryption_ctx,
-                dp_clip_norm=dp_clip_norm if use_dp else None,
+                dp_clip_norm=None if adaptive_client_clip else (dp_clip_norm if use_dp else None),
                 dp_noise_multiplier=dp_noise_multiplier if (use_dp and dp_mechanism == "gaussian") else 0.0,
                 dp_mode=dp_mode if use_dp else "client_level",
                 dp_mechanism=dp_mechanism if use_dp else "gaussian",
@@ -137,9 +222,26 @@ def _run_fl_rounds(global_model, partitions, train_ds, test_loader, device, conf
                 dp_epsilon=dp_epsilon if use_dp else 0.0,
                 dp_delta=dp_delta,
                 dp_debug=dp_debug and use_dp,
+                return_model_delta=adaptive_client_clip,
+                dp_clip_strategy=dp_clip_strategy if use_dp else "fixed",
+                dp_clip_quantile=getattr(config, "dp_clip_quantile", 50.0),
+                dp_clip_alpha=getattr(config, "dp_clip_alpha", 0.9),
+                dp_clip_min=getattr(config, "dp_clip_min", 0.1),
+                dp_clip_max=getattr(config, "dp_clip_max", 10.0),
             )
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
+        if adaptive_client_clip:
+            norms = [_client_update_norm(update) for update in client_updates]
+            clip_norm_current = _compute_adaptive_clip_norm(config, norms, dp_clip_norm)
+            _apply_client_level_dp_after_adaptive_clip(
+                client_updates,
+                mechanism=dp_mechanism,
+                epsilon=dp_epsilon,
+                delta=dp_delta,
+                clip_norm=clip_norm_current,
+                debug=dp_debug,
+            )
         aggregator.federated_average(client_updates, global_model)
         if ema is not None:
             ema.update(global_model)
@@ -222,6 +324,7 @@ def run(config):
     dp_target_delta = getattr(config, "dp_target_delta", 1e-5)
     dp_mode = getattr(config, "dp_mode", "client_level")
     dp_mechanism = getattr(config, "dp_mechanism", "gaussian")
+    dp_clip_strategy = getattr(config, "dp_clip_strategy", "adaptive")
     dp_laplace_epsilon = getattr(config, "dp_laplace_epsilon", 5.0)
     warmup_rounds = getattr(config, "warmup_rounds", 0)
     use_ema = getattr(config, "use_ema", False)
@@ -255,6 +358,12 @@ def run(config):
         raise ValueError(
             "pretrain_rounds > 0 is incompatible with a valid DP claim. "
             "Run pretraining as a separate non-DP experiment, then run DP with --pretrain_rounds 0."
+        )
+
+    if use_dp and dp_mode == "client_level" and dp_clip_strategy in {"quantile", "adaptive"} and encryption_ctx is not None:
+        raise ValueError(
+            "Client-level quantile/adaptive clipping needs plaintext client deltas before DP. "
+            "Use --dp_clip_strategy fixed with encryption, or run DP without HE."
         )
 
     if use_dp and config.local_epochs > 3:
@@ -325,8 +434,20 @@ def run(config):
                 print("[DP] Laplace calibration: b = sqrt(d) * clip_norm / epsilon after full-vector L2 clipping.")
         if dp_mode == "dp_sgd":
             print("[DP] Semantics: gradient-level batch DP in local training. Strict example-level DP-SGD requires per-example gradients.")
+            print(
+                f"[DP] DP-SGD clipping: strategy={dp_clip_strategy} "
+                f"quantile={getattr(config, 'dp_clip_quantile', 50.0)} "
+                f"alpha={getattr(config, 'dp_clip_alpha', 0.9)} "
+                f"range=[{getattr(config, 'dp_clip_min', 0.1)}, {getattr(config, 'dp_clip_max', 10.0)}]"
+            )
         else:
             print("[DP] Semantics: local, client-level DP on transmitted updates.")
+            print(
+                f"[DP] Client clipping: strategy={dp_clip_strategy} "
+                f"quantile={getattr(config, 'dp_clip_quantile', 50.0)} "
+                f"alpha={getattr(config, 'dp_clip_alpha', 0.9)} "
+                f"range=[{getattr(config, 'dp_clip_min', 0.1)}, {getattr(config, 'dp_clip_max', 10.0)}]"
+            )
         if warmup_rounds > 0:
             print(f"[DP] LR schedule: {warmup_rounds} warmup rounds + cosine decay over {config.rounds} rounds")
     else:
@@ -376,6 +497,7 @@ def run(config):
             current_lr = config.lr
 
         client_updates: List = []
+        adaptive_client_clip = use_dp and dp_mode == "client_level" and dp_clip_strategy in {"quantile", "adaptive"}
         for cid, idxs in enumerate(partitions):
             subset = torch.utils.data.Subset(train_ds, idxs)
             loader = DataLoader(subset, batch_size=config.batch_size, shuffle=True)
@@ -384,7 +506,7 @@ def run(config):
                 lr=current_lr, momentum=0.9, weight_decay=config.weight_decay,
                 scheduler=config.scheduler,
                 encryption_context=encryption_ctx,
-                dp_clip_norm=dp_clip_norm if use_dp else None,
+                dp_clip_norm=None if adaptive_client_clip else (dp_clip_norm if use_dp else None),
                 dp_noise_multiplier=dp_noise_multiplier if (use_dp and dp_mechanism == "gaussian") else 0.0,
                 dp_mode=dp_mode if use_dp else "client_level",
                 dp_mechanism=dp_mechanism if use_dp else "gaussian",
@@ -392,9 +514,27 @@ def run(config):
                 dp_epsilon=dp_epsilon if use_dp else 0.0,
                 dp_delta=dp_target_delta,
                 dp_debug=dp_debug and use_dp,
+                return_model_delta=adaptive_client_clip,
+                dp_clip_strategy=dp_clip_strategy if use_dp else "fixed",
+                dp_clip_quantile=getattr(config, "dp_clip_quantile", 50.0),
+                dp_clip_alpha=getattr(config, "dp_clip_alpha", 0.9),
+                dp_clip_min=getattr(config, "dp_clip_min", 0.1),
+                dp_clip_max=getattr(config, "dp_clip_max", 10.0),
             )
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
+
+        if adaptive_client_clip:
+            norms = [_client_update_norm(update) for update in client_updates]
+            clip_norm_current = _compute_adaptive_clip_norm(config, norms, dp_clip_norm)
+            _apply_client_level_dp_after_adaptive_clip(
+                client_updates,
+                mechanism=dp_mechanism,
+                epsilon=dp_epsilon,
+                delta=dp_target_delta,
+                clip_norm=clip_norm_current,
+                debug=dp_debug,
+            )
 
         total_train_time = sum(u.train_time for u in client_updates)
         total_encrypt_time = sum(u.encrypt_time for u in client_updates)
@@ -541,6 +681,16 @@ def parse_args():
                    help="Differential Privacy'yi etkinleştir (DP-FedAvg).")
     p.add_argument("--dp_clip_norm", type=float, default=1.0,
                    help="DP için L2 clip normu (varsayılan: 1.0).")
+    p.add_argument("--dp_clip_strategy", choices=["fixed", "quantile", "adaptive"], default="adaptive",
+                   help="DP clipping strategy. DP-SGD uses per-example gradient norms; client_level uses client update norms.")
+    p.add_argument("--dp_clip_quantile", type=float, default=50.0,
+                   help="Norm percentile for quantile/adaptive clipping.")
+    p.add_argument("--dp_clip_alpha", type=float, default=0.9,
+                   help="Moving-average smoothing factor for adaptive clipping.")
+    p.add_argument("--dp_clip_min", type=float, default=0.1,
+                   help="Minimum clamp for quantile/adaptive clip norm.")
+    p.add_argument("--dp_clip_max", type=float, default=10.0,
+                   help="Maximum clamp for quantile/adaptive clip norm.")
     p.add_argument("--dp_mode", choices=["dp_sgd", "client_level"], default="client_level",
                    help="DP modu: dp_sgd gradyan seviyesinde, client_level model update seviyesinde DP uygular.")
     p.add_argument("--dp_mechanism", choices=["gaussian", "laplace"], default="gaussian",
