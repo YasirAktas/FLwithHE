@@ -225,115 +225,153 @@ Round 01: Acc=95.12% Loss=0.1543 | Train=8.21s Encrypt=3.45s Agg=0.92s | Total=1
 
 ## Differential Privacy (DP)
 
-Bu projede 3 ayrı çalışma modu vardır:
-- Sadece HE: `--use_encryption`
-- Sadece DP: `--use_dp`
-- HE + DP birlikte: `--use_encryption --use_dp`
+Bu projede DP iki ayrı modda çalıştırılabilir:
 
-Yani DP, HE'den bağımsız çalışır. İlk aşamada DP'yi tek başına test edip baseline ile karşılaştırabilir, sonra aynı ayarları HE + DP modunda yeniden çalıştırabilirsin.
+| Mod | Bayrak | Nerede uygulanır? |
+|---|---|---|
+| DP-SGD | `--dp_mode dp_sgd` | Lokal eğitim sırasında, per-example gradient clipping + noise |
+| Client-level DP | `--dp_mode client_level` | Lokal eğitim bittikten sonra, full model update delta üzerinde |
 
-### Genel Bakış
-
-FL + HE + DP bütünleşik akışı:
-1. **Client** — eğitim biter, `delta = local_weights − global_weights` hesapla
-2. **Client** — deltayı L2 norm ile kırp (`clip_norm`) → gizlilik "duyarlılığı" sınırlanır
-3. **Client** — HE ile şifrele (opsiyonel)
-4. **Server** — HE aggregate → decrypt → ortalama al
-5. **Server** — ortalamaya Gaussian gürültüsü ekle: `N(0, σ²)`, σ = `noise_multiplier × clip_norm / n_clients`
-6. **Server** — gürültülü modeli yayınla, privacy budget (ε) raporla
-
-### Kurulum
+Her iki modda da şu mekanizmalar desteklenir:
 
 ```cmd
-pip install opendp numpy
+--dp_mechanism gaussian
+--dp_mechanism laplace
 ```
 
-### Nasıl Etkinleştirilir?
+DP gürültüsü `epsilon` ve `delta` ile kalibre edilir. Eski `--dp_noise_multiplier` geriye dönük uyumluluk için kalmıştır; yeni deneylerde `--dp_epsilon` kullanın.
 
-Önce baseline (ne HE ne DP):
+### DP-SGD Nasıl Çalışır?
+
+DP-SGD akışı:
+
+```text
+for each sample in batch:
+    compute grad_i
+    clip grad_i
+stack clipped gradients
+average
+add calibrated noise
+optimizer.step()
+```
+
+Gaussian DP-SGD L2 clipping kullanır. Laplace DP-SGD L1 clipping kullanır; çünkü Laplace mekanizması L1 sensitivity gerektirir.
+
+DP-SGD + Gaussian:
+
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_target_delta 1e-5
 ```
 
-Sadece DP:
+DP-SGD + Laplace:
+
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_dp
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --use_dp --dp_mode dp_sgd --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_target_delta 1e-5
 ```
 
-Sadece HE:
+DP-SGD adaptive clipping, her batch içindeki per-example gradient normlarını kullanır:
+
+```text
+[ADAPTIVE CLIP][DP-SGD]
+  quantile clip: ...
+  running clip: ...
+  min norm: ...
+  max norm: ...
+```
+
+### Client-Level DP Nasıl Çalışır?
+
+Client-level DP akışı:
+
+```text
+client trains locally
+delta = local_weights - global_weights
+flatten full delta vector
+clip full delta
+add calibrated noise
+server averages noisy deltas
+```
+
+Bu mod full model update vector yapısını korur; sparsification veya parametre çıkarma yapılmaz.
+
+Client-level DP + Gaussian + adaptive clipping:
+
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_encryption --encryption_scheme ckks
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_target_delta 1e-5
 ```
 
-DP + HE birlikte:
+Client-level DP + Laplace + adaptive clipping:
+
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_dp --use_encryption --encryption_scheme ckks
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --use_dp --dp_mode client_level --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_target_delta 1e-5
 ```
 
-Daha güçlü gizlilik (büyük sigma → küçük ε, model doğruluğu düşer):
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 10 --rounds 10 --use_dp --dp_clip_norm 1.0 --dp_noise_multiplier 0.1 --dp_target_delta 1e-5
+Client-level adaptive clipping, aynı round içindeki client update normlarını kullanır:
+
+```text
+[ADAPTIVE CLIP]
+  quantile clip: ...
+  running clip: ...
+  min norm: ...
+  max norm: ...
 ```
 
-### Parametre Kılavuzu
+### Adaptive Clipping Ayarları
 
 | Parametre | Varsayılan | Açıklama |
-|---|---|---|
-| `--use_dp` | kapalı | DP'yi etkinleştir |
-| `--dp_clip_norm` | `1.0` | L2 clip normu. Modelin tipik update norm'una göre ayarla. |
-| `--dp_noise_multiplier` | `0.01` | σ / clip_norm oranı. Büyüdükçe ε küçülür, doğruluk düşer. |
-| `--dp_target_delta` | `1e-5` | Hedef δ. Genellikle `1/veri_seti_boyutu` seçilir. |
+|---|---:|---|
+| `--dp_clip_strategy` | `adaptive` | `fixed`, `quantile`, veya `adaptive` |
+| `--dp_clip_norm` | `1.0` | `fixed` clipping için kullanılan norm |
+| `--dp_clip_quantile` | `50` | Norm dağılımından seçilecek percentile; `50` median |
+| `--dp_clip_alpha` | `0.9` | Adaptive moving-average smoothing katsayısı |
+| `--dp_clip_min` | `0.1` | Clip norm alt sınırı |
+| `--dp_clip_max` | `10.0` | Clip norm üst sınırı |
+| `--dp_epsilon` | `1.0` | Round başına epsilon |
+| `--dp_target_delta` | `1e-5` | Gaussian DP için delta |
 
-> **Önemli:** `noise_multiplier` değeri ile model doğruluğu ters orantılıdır.  
-> Az client (< 10) ve yüksek `noise_multiplier` (> 0.1) → model eğitimi bozulabilir.  
-> Makul bir başlangıç: `--dp_clip_norm 1.0 --dp_noise_multiplier 0.01`.
+Adaptive clipping sensitivity değerini belirler. Gaussian mekanizmasında:
 
-### Konsol Çıktısı
-
-DP aktifken:
-```
-[MODE] DP
-[DP] ACTIVE | clip_norm=1.0  noise_multiplier=0.01  delta=1e-05  ≈ epsilon=10678.6140
-Round 01: Acc=92.40% Loss=0.2513 | Train=28.3s Encrypt=0.00s Agg=0.01s | Total=31.2s
+```text
+sigma = clip_norm * sqrt(2 * log(1.25 / delta)) / epsilon
 ```
 
-HE + DP birlikteyken:
-```
-[MODE] HE+DP
-[HE] Encryption: ACTIVE (dataset=mnist, scheme=ckks)
-[DP] ACTIVE | clip_norm=1.0  noise_multiplier=0.01  delta=1e-05  ≈ epsilon=10678.6140
-```
+Laplace mekanizmasında sensitivity L1 normuna göre kalibre edilir.
 
-### Privacy–Accuracy Dengesi
+### Sabit Clipping ile Çalıştırma
 
-| noise_multiplier | σ (n=5) | Beklenen etki |
-|---|---|---|
-| `0.001` | çok küçük | Model neredeyse zarar görmez; ε büyük |
-| `0.01` | küçük | Minimal doğruluk kaybı; makul ε |
-| `0.1` | orta | Belirgin doğruluk düşüşü; güçlü gizlilik |
-| `1.0+` | büyük | Model eğitimi bozulabilir; çok küçük ε |
+Adaptive clipping istemiyorsanız:
 
-### API Özeti
-
-- [src/privacy/dp_utils.py](src/privacy/dp_utils.py)
-  - `clip_delta(delta, clip_norm)` — model güncelleme deltasını L2 norm ile kırpar
-  - `add_gaussian_noise(state, clip_norm, noise_multiplier, num_clients)` — aggregate sonrası Gaussian gürültüsü ekler
-  - `compute_epsilon(noise_multiplier, num_rounds, target_delta)` — zCDP formülüyle ε hesaplar
-
-### Önerilen Sıralı Deney Planı
-
-1. Baseline çalıştır: ne HE ne DP açık olsun.
-2. Sadece HE çalıştır: performans ve süre etkisini ölç.
-3. Sadece DP çalıştır: accuracy ve epsilon etkisini ölç.
-4. En son HE + DP çalıştır: birleşik maliyet ve davranışı karşılaştır.
-
-Örnek seri:
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_encryption --encryption_scheme ckks
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_dp --dp_clip_norm 1.0 --dp_noise_multiplier 0.01
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_encryption --encryption_scheme ckks --use_dp --dp_clip_norm 1.0 --dp_noise_multiplier 0.01
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_clip_strategy fixed --dp_clip_norm 0.2 --dp_epsilon 3 --dp_target_delta 1e-5
 ```
+
+### Debugging
+
+Noise/signal oranını ve clipping davranışını görmek için:
+
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 2 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_clip_strategy adaptive --dp_debug
+```
+
+Debug çıktıları:
+
+```text
+signal_norm: ...
+noise_norm: ...
+ratio: ...
+WARNING: noise dominates signal
+```
+
+### Önerilen Deney Sırası
+
+1. Baseline: `--use_dp` kapalı.
+2. DP-SGD + Gaussian.
+3. DP-SGD + Laplace.
+4. Client-level DP + Gaussian.
+5. Client-level DP + Laplace.
+6. `--dp_clip_strategy fixed` ve `adaptive` sonuçlarını karşılaştır.
+
+Not: `local_epochs > 3` DP deneylerinde privacy/utility dengesini bozabilir; runner bu durumda uyarı verir.
 
 ---
 
@@ -416,7 +454,6 @@ python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_medium --num_clients 
 | STTC | 2 | ST/T Değişikliği |
 | CD | 3 | İletim Bozukluğu |
 | HYP | 4 | Hipertrofi |
-
 
 
 
