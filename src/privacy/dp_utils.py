@@ -387,11 +387,12 @@ def apply_dp_sgd(
             clip_norm_eff = max(float(clip_min), min(clip_norm_eff, float(clip_max)))
             if clip_state is not None:
                 clip_state["running"] = clip_norm_eff
-            print("[ADAPTIVE CLIP][DP-SGD]")
-            print("  quantile clip:", clip_norm_current)
-            print("  running clip:", clip_norm_eff)
-            print("  min norm:", min(raw_norms))
-            print("  max norm:", max(raw_norms))
+            if debug:
+                print("[ADAPTIVE CLIP][DP-SGD]")
+                print("  quantile clip:", clip_norm_current)
+                print("  running clip:", clip_norm_eff)
+                print("  min norm:", min(raw_norms))
+                print("  max norm:", max(raw_norms))
 
         for flat_grad in flat_grads:
             clipped_grad, _raw_norm, clipped_norm, clip_factor = clip_update(
@@ -534,24 +535,9 @@ def apply_client_dp(
         noise_scale = laplace_noise_scale(epsilon=epsilon, clip_norm=clip_norm_eff, dimension=d)
     noise = _sample_noise_like(clipped_update, mechanism, noise_scale)
     assert_finite_tensor(f"{debug_prefix}client_update_noise", noise)
-    sigma = noise_scale
-    print("sigma:", sigma)
-    print("noise mean:", noise.mean().item())
-    print("noise std:", noise.std().item())
-    print("noise norm:", torch.norm(noise).item())
-    print("expected norm:", math.sqrt(update.numel()) * sigma)
     signal_norm = torch.norm(clipped_update).item()
     noise_norm = torch.norm(noise).item()
     signal_noise_ratio = noise_norm / (signal_norm + 1e-6)
-
-    print(f"{debug_prefix}Client-level DP signal/noise:")
-    print("  signal_norm:", signal_norm)
-    print("  noise_norm:", noise_norm)
-    print("  ratio:", signal_noise_ratio)
-    if signal_noise_ratio > 10.0:
-        print("WARNING: noise dominates signal")
-    if signal_noise_ratio > 100.0:
-        print("WARNING: epsilon too small for this dimension")
 
     noisy_update = clipped_update + noise
     assert_finite_tensor(f"{debug_prefix}client_update_after_noise", noisy_update)

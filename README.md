@@ -225,153 +225,237 @@ Round 01: Acc=95.12% Loss=0.1543 | Train=8.21s Encrypt=3.45s Agg=0.92s | Total=1
 
 ## Differential Privacy (DP)
 
-Bu projede DP iki ayrı modda çalıştırılabilir:
+This project supports two DP algorithms and two noise mechanisms.
 
-| Mod | Bayrak | Nerede uygulanır? |
+### DP Algorithms
+
+| Algorithm | Flag | Where DP is applied |
 |---|---|---|
-| DP-SGD | `--dp_mode dp_sgd` | Lokal eğitim sırasında, per-example gradient clipping + noise |
-| Client-level DP | `--dp_mode client_level` | Lokal eğitim bittikten sonra, full model update delta üzerinde |
+| DP-SGD | `--dp_mode dp_sgd` | During local training (per-example gradients) |
+| Client-level DP | `--dp_mode client_level` | After local training, on each client delta |
+| Server-level DP | `--dp_mode server_level` | On server, after clipping client deltas and aggregating |
 
-Her iki modda da şu mekanizmalar desteklenir:
+#### 1) DP-SGD (`--dp_mode dp_sgd`)
+
+```text
+for each batch:
+  for each sample:
+    compute grad_i
+    clip grad_i
+  average clipped grads
+  add calibrated noise
+  optimizer.step()
+```
+
+- Strong per-example control.
+- More private-training style, but slower (per-example gradient loop).
+- In this repo: Gaussian DP-SGD uses L2 clipping; Laplace DP-SGD uses L1 clipping.
+
+#### 2) Client-level DP (`--dp_mode client_level`)
+
+```text
+train locally (standard SGD)
+delta = local_model - global_model
+flatten delta
+clip once
+add calibrated noise once
+send noisy delta to server
+server averages
+```
+
+- Faster than DP-SGD.
+- Usually noisier at the same epsilon because the full high-dimensional update is privatized.
+
+#### 3) Server-level DP (`--dp_mode server_level`)
+
+```text
+clients train locally (no local DP)
+clients send model deltas
+server clips each client delta
+server computes weighted average delta
+server adds DP noise once to aggregated delta
+server updates global model
+```
+
+- Fast client-side training (no per-example DP on clients).
+- Central/trusted-server DP design.
+- Not compatible with encrypted aggregation in current implementation (needs plaintext deltas for clipping).
+
+### DP Mechanisms
+
+| Mechanism | Flag | Privacy type | Calibration summary |
+|---|---|---|---|
+| Gaussian | `--dp_mechanism gaussian` | \((\epsilon,\delta)\)-DP | \(\sigma \propto \text{sensitivity}/\epsilon\), uses `--dp_target_delta` |
+| Laplace | `--dp_mechanism laplace` | \((\epsilon,0)\)-DP | \(b = \text{sensitivity}_{L1}/\epsilon\), `delta=0` |
+
+Notes:
+- Prefer Gaussian first for stability.
+- Laplace can be significantly noisier in high dimensions.
+
+### Clipping Strategies (How clipping works)
+
+| Strategy | Flag | How it chooses clipping norm |
+|---|---|---|
+| Fixed | `--dp_clip_strategy fixed` | Always uses `--dp_clip_norm` |
+| Quantile | `--dp_clip_strategy quantile` | Uses current norm distribution percentile (`--dp_clip_quantile`) |
+| Adaptive | `--dp_clip_strategy adaptive` | EMA-smoothed quantile using `--dp_clip_alpha`, clamped by `--dp_clip_min/max` |
+
+Clipping directly sets sensitivity. Noise is calibrated from this effective clip norm.
+
+### Important DP Parameters
+
+| Parameter | Default | Description |
+|---|---:|---|
+| `--use_dp` | off | Enables DP |
+| `--dp_mode` | `client_level` | `dp_sgd`, `client_level`, or `server_level` |
+| `--dp_mechanism` | `gaussian` | `gaussian` or `laplace` |
+| `--dp_epsilon` | `1.0` | Per-round epsilon used by runner |
+| `--dp_target_delta` | `1e-5` | Delta for Gaussian |
+| `--dp_clip_strategy` | `adaptive` | `fixed`, `quantile`, `adaptive` |
+| `--dp_clip_norm` | `1.0` | Base clip norm |
+| `--dp_clip_quantile` | `50` | Percentile for quantile/adaptive |
+| `--dp_clip_alpha` | `0.9` | EMA smoothing for adaptive |
+| `--dp_clip_min` | `0.1` | Min clamp for adaptive/quantile |
+| `--dp_clip_max` | `10.0` | Max clamp for adaptive/quantile |
+| `--dp_debug` | off | Verbose clipping/noise diagnostics |
+
+---
+
+### How To Run: DP-SGD with different clipping strategies
+
+Base template:
+
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy <STRATEGY> --dp_clip_norm 1.0
+```
+
+#### A) Fixed clipping
+
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy fixed --dp_clip_norm 1.0
+```
+
+#### B) Quantile clipping
+
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy quantile --dp_clip_quantile 50 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
+```
+
+#### C) Adaptive clipping
+
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
+```
+
+### How To Switch DP Mechanism (Gaussian vs Laplace)
+
+Only change:
 
 ```cmd
 --dp_mechanism gaussian
+```
+
+to:
+
+```cmd
 --dp_mechanism laplace
 ```
 
-DP gürültüsü `epsilon` ve `delta` ile kalibre edilir. Eski `--dp_noise_multiplier` geriye dönük uyumluluk için kalmıştır; yeni deneylerde `--dp_epsilon` kullanın.
-
-### DP-SGD Nasıl Çalışır?
-
-DP-SGD akışı:
-
-```text
-for each sample in batch:
-    compute grad_i
-    clip grad_i
-stack clipped gradients
-average
-add calibrated noise
-optimizer.step()
-```
-
-Gaussian DP-SGD L2 clipping kullanır. Laplace DP-SGD L1 clipping kullanır; çünkü Laplace mekanizması L1 sensitivity gerektirir.
-
-DP-SGD + Gaussian:
+Example (DP-SGD + Laplace + adaptive clipping):
 
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_target_delta 1e-5
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
 ```
 
-DP-SGD + Laplace:
+### How To Run Client-level DP with different clipping strategies
+
+#### Client-level + fixed clipping
 
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --use_dp --dp_mode dp_sgd --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_target_delta 1e-5
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy fixed --dp_clip_norm 1.0
 ```
 
-DP-SGD adaptive clipping, her batch içindeki per-example gradient normlarını kullanır:
-
-```text
-[ADAPTIVE CLIP][DP-SGD]
-  quantile clip: ...
-  running clip: ...
-  min norm: ...
-  max norm: ...
-```
-
-### Client-Level DP Nasıl Çalışır?
-
-Client-level DP akışı:
-
-```text
-client trains locally
-delta = local_weights - global_weights
-flatten full delta vector
-clip full delta
-add calibrated noise
-server averages noisy deltas
-```
-
-Bu mod full model update vector yapısını korur; sparsification veya parametre çıkarma yapılmaz.
-
-Client-level DP + Gaussian + adaptive clipping:
+#### Client-level + quantile clipping
 
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_target_delta 1e-5
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy quantile --dp_clip_quantile 50 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
 ```
 
-Client-level DP + Laplace + adaptive clipping:
+#### Client-level + adaptive clipping
 
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --use_dp --dp_mode client_level --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_target_delta 1e-5
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
 ```
 
-Client-level adaptive clipping, aynı round içindeki client update normlarını kullanır:
+### How To Run Server-level DP
 
-```text
-[ADAPTIVE CLIP]
-  quantile clip: ...
-  running clip: ...
-  min norm: ...
-  max norm: ...
-```
-
-### Adaptive Clipping Ayarları
-
-| Parametre | Varsayılan | Açıklama |
-|---|---:|---|
-| `--dp_clip_strategy` | `adaptive` | `fixed`, `quantile`, veya `adaptive` |
-| `--dp_clip_norm` | `1.0` | `fixed` clipping için kullanılan norm |
-| `--dp_clip_quantile` | `50` | Norm dağılımından seçilecek percentile; `50` median |
-| `--dp_clip_alpha` | `0.9` | Adaptive moving-average smoothing katsayısı |
-| `--dp_clip_min` | `0.1` | Clip norm alt sınırı |
-| `--dp_clip_max` | `10.0` | Clip norm üst sınırı |
-| `--dp_epsilon` | `1.0` | Round başına epsilon |
-| `--dp_target_delta` | `1e-5` | Gaussian DP için delta |
-
-Adaptive clipping sensitivity değerini belirler. Gaussian mekanizmasında:
-
-```text
-sigma = clip_norm * sqrt(2 * log(1.25 / delta)) / epsilon
-```
-
-Laplace mekanizmasında sensitivity L1 normuna göre kalibre edilir.
-
-### Sabit Clipping ile Çalıştırma
-
-Adaptive clipping istemiyorsanız:
+#### Server-level + Gaussian + adaptive clipping
 
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_clip_strategy fixed --dp_clip_norm 0.2 --dp_epsilon 3 --dp_target_delta 1e-5
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode server_level --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
 ```
 
-### Debugging
-
-Noise/signal oranını ve clipping davranışını görmek için:
+#### Server-level + Laplace + fixed clipping
 
 ```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 2 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_clip_strategy adaptive --dp_debug
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode server_level --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy fixed --dp_clip_norm 1.0
 ```
 
-Debug çıktıları:
+---
+
+### Debugging DP behavior
+
+Use:
+
+```cmd
+python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 2 --local_epochs 1 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy adaptive --dp_debug
+```
+
+Typical debug signals:
 
 ```text
-signal_norm: ...
-noise_norm: ...
-ratio: ...
-WARNING: noise dominates signal
+raw_norm / clipped_norm
+clip_factor
+noise_scale
+signal_norm vs noise_norm ratio
 ```
 
-### Önerilen Deney Sırası
+### Understanding DP Logs (What each log means)
 
-1. Baseline: `--use_dp` kapalı.
-2. DP-SGD + Gaussian.
-3. DP-SGD + Laplace.
-4. Client-level DP + Gaussian.
-5. Client-level DP + Laplace.
-6. `--dp_clip_strategy fixed` ve `adaptive` sonuçlarını karşılaştır.
+Round log example:
 
-Not: `local_epochs > 3` DP deneylerinde privacy/utility dengesini bozabilir; runner bu durumda uyarı verir.
+```text
+Round 03: Acc=78.40% Loss=0.9210 eps=9.0000 | Train=12.40s Encrypt=0.00s Agg=0.05s | DP(raw=2.311 clip=0.994 factor=0.430 noise_scale=0.812 noise_norm=7.921 n/s=3.124) | Total=12.58s Elapsed=39.91s
+```
+
+How to interpret:
+
+- `Acc`, `Loss`: global model quality on evaluation set.
+- `eps=...`: accumulated epsilon shown by the runner up to this round.
+- `Train`, `Encrypt`, `Agg`: time spent in local training, optional encryption, and server aggregation.
+- `DP(raw=...)`: average norm before clipping.
+- `DP(clip=...)`: average norm after clipping.
+- `DP(factor=...)`: average clipping multiplier in `[0, 1]`; smaller means stronger clipping.
+- `DP(noise_scale=...)`: calibrated Gaussian std (or Laplace scale) used for noise.
+- `DP(noise_norm=...)`: observed norm of sampled noise vector(s).
+- `DP(n/s=...)`: noise-to-signal ratio (`noise_norm / signal_norm` in this code path).
+
+Quick rules of thumb:
+
+- `clip << raw` and very small `factor` means aggressive clipping (possible underfitting).
+- Very large `n/s` means noise dominates signal (training may become unstable).
+- Stable useful training typically needs a balance: non-trivial clipping, but `n/s` not constantly extreme.
+
+### Suggested experiment order
+
+1. Baseline (`--use_dp` off).
+2. DP-SGD + Gaussian + adaptive clipping.
+3. DP-SGD + Gaussian + fixed clipping.
+4. DP-SGD + Laplace + adaptive clipping.
+5. Client-level + Gaussian.
+6. Client-level + Laplace.
+
+Note: `local_epochs > 3` can hurt privacy/utility balance in DP runs; runner prints a warning.
 
 ---
 
@@ -454,6 +538,3 @@ python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_medium --num_clients 
 | STTC | 2 | ST/T Değişikliği |
 | CD | 3 | İletim Bozukluğu |
 | HYP | 4 | Hipertrofi |
-
-
-
