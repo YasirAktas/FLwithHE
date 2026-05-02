@@ -1,4 +1,4 @@
-# Default configuration for FL with optional HE
+# Default configuration for FL with optional HE and DP
 num_clients: 5
 rounds: 5
 local_epochs: 1
@@ -7,5 +7,9 @@ lr: 0.01
 seed: 42
 partition: iid          # iid or dirichlet
 dirichlet_alpha: 0.5
-use_encryption: false   # set true when HE context implemented
+use_encryption: false   # HE-only or HE+DP için true
+use_dp: false           # DP-only or HE+DP için true
+dp_clip_norm: 1.0
+dp_noise_multiplier: 0.01
+dp_target_delta: 1.0e-5
 no_cuda: false

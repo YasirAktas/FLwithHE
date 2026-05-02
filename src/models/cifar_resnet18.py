@@ -70,6 +70,17 @@ class ImprovedCIFAR10CNN(nn.Module):
         out = self.linear(out)  # [batch, 10]
         return out
 
+def replace_bn_with_gn(module: nn.Module, num_groups: int = 8) -> nn.Module:
+    """Recursively replace all BatchNorm2d/1d with GroupNorm."""
+    for name, child in module.named_children():
+        if isinstance(child, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            num_channels = child.num_features
+            setattr(module, name, nn.GroupNorm(min(num_groups, num_channels), num_channels))
+        else:
+            replace_bn_with_gn(child, num_groups)
+    return module
+
+
 class ResNetCIFAR10(nn.Module):
     """
     CIFAR-10 için ResNet-18: ilk konvolüsyon 3x3/stride=1 ve maxpool kaldırıldı.
@@ -85,9 +96,48 @@ class ResNetCIFAR10(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
+class DPResNetCIFAR10(nn.Module):
+    """
+    DP-friendly ResNet-18 for CIFAR-10.
+    BatchNorm → GroupNorm for stable DP training with small/varying batches.
+    """
+    def __init__(self, num_groups: int = 8):
+        super().__init__()
+        m = models.resnet18(weights=None, num_classes=10)
+        m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        m.maxpool = nn.Identity()
+        replace_bn_with_gn(m, num_groups)
+        self.model = m
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+
+class EMAModel:
+    """Exponential Moving Average of model parameters for smoother convergence under DP noise."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {k: v.clone().detach() for k, v in model.state_dict().items()}
+
+    def update(self, model: nn.Module):
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                if v.is_floating_point():
+                    self.shadow[k].mul_(self.decay).add_(v, alpha=1 - self.decay)
+                else:
+                    self.shadow[k].copy_(v)
+
+    def apply_to(self, model: nn.Module):
+        model.load_state_dict(self.shadow)
+
+    def state_dict(self):
+        return dict(self.shadow)
+
+
 if __name__ == "__main__":
-    # Quick shape smoke test for CIFAR-10 (ResNet)
-    model = ResNetCIFAR10()
-    x = torch.randn(4, 3, 32, 32)
-    y = model(x)
-    print("Output shape:", y.shape)  # Expect [4, 10]
+    for cls in [ResNetCIFAR10, DPResNetCIFAR10, ImprovedCIFAR10CNN]:
+        model = cls()
+        x = torch.randn(4, 3, 32, 32)
+        y = model(x)
+        print(f"{cls.__name__} -> output shape: {y.shape}")
