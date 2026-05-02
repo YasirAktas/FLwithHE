@@ -8,7 +8,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from src.he.encryption import PaillierContext
-from src.privacy.dp_utils import apply_dp_sgd, privatize_update_delta
+from src.privacy.dp_utils import apply_dp_sgd
 
 @dataclass
 class ClientUpdate:
@@ -28,7 +28,7 @@ class ClientUpdate:
     laplace_expected_noise_l2: float = 0.0
 
 class Client:
-    def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None, dp_clip_norm: Optional[float] = None, dp_noise_multiplier: float = 0.0, dp_mode: str = "client_level", dp_mechanism: str = "gaussian", dp_laplace_epsilon_per_round: float = 0.0, dp_epsilon: float = 0.0, dp_delta: float = 1e-5, dp_debug: bool = False, return_model_delta: bool = False, dp_clip_strategy: str = "fixed", dp_clip_quantile: float = 50.0, dp_clip_alpha: float = 0.9, dp_clip_min: float = 0.1, dp_clip_max: float = 10.0):
+    def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None, dp_clip_norm: Optional[float] = None, dp_mechanism: str = "gaussian", dp_epsilon: float = 0.0, dp_delta: float = 1e-5, dp_debug: bool = False, dp_clip_strategy: str = "fixed", dp_clip_quantile: float = 50.0, dp_clip_alpha: float = 0.9, dp_clip_min: float = 0.1, dp_clip_max: float = 10.0):
         self.client_id = client_id
         self.dataloader = dataloader
         self.device = device
@@ -38,14 +38,10 @@ class Client:
         self.scheduler = scheduler
         self.encryption_context = encryption_context
         self.dp_clip_norm = dp_clip_norm  # DP: L2 clip normu (None → DP kapalı)
-        self.dp_noise_multiplier = dp_noise_multiplier
-        self.dp_mode = dp_mode
         self.dp_mechanism = dp_mechanism
-        self.dp_laplace_epsilon_per_round = dp_laplace_epsilon_per_round
         self.dp_epsilon = dp_epsilon
         self.dp_delta = dp_delta
         self.dp_debug = dp_debug
-        self.return_model_delta = return_model_delta
         self.dp_clip_strategy = dp_clip_strategy
         self.dp_clip_quantile = dp_clip_quantile
         self.dp_clip_alpha = dp_clip_alpha
@@ -68,7 +64,7 @@ class Client:
         model_local.train()
         train_start = time.time()
         dp_sgd_stats = {"raw_norm": 0.0, "clipped_norm": 0.0, "noise_norm": 0.0, "noise_scale": 0.0, "clip_norm": 0.0, "clip_factor": 1.0, "steps": 0.0}
-        use_dp_sgd = self.dp_clip_norm is not None and self.dp_mode == "dp_sgd"
+        use_dp_sgd = self.dp_clip_norm is not None
         for epoch_idx in range(epochs):
             if use_dp_sgd:
                 epoch_stats = apply_dp_sgd(
@@ -168,46 +164,6 @@ class Client:
                 gaussian_std = noise_scale
             else:
                 laplace_scale = noise_scale
-
-        if self.return_model_delta or (self.dp_clip_norm is not None and self.dp_mode == "client_level" and self.dp_mechanism in {"gaussian", "laplace"}):
-            global_sd = {k: v.detach().to(device=sd[k].device) for k, v in global_model.state_dict().items()}
-            delta = {k: sd[k] - global_sd[k] for k in global_sd if sd[k].is_floating_point()}
-            raw_update_norm = math.sqrt(sum(v.norm(p=2).item() ** 2 for v in delta.values()))
-
-        if self.return_model_delta and not (self.dp_clip_norm is not None and self.dp_mode == "client_level"):
-            sd = delta
-            is_model_delta = True
-
-        # Client-level DP is applied to the transmitted client update delta.
-        if self.dp_clip_norm is not None and self.dp_mode == "client_level" and self.dp_mechanism in {"gaussian", "laplace"}:
-            epsilon = self.dp_epsilon
-            if epsilon <= 0 and self.dp_mechanism == "laplace":
-                epsilon = self.dp_laplace_epsilon_per_round
-            if epsilon <= 0 and self.dp_mechanism == "gaussian" and self.dp_noise_multiplier > 0:
-                epsilon = 1.0 / self.dp_noise_multiplier
-
-            sd, raw_update_norm, clipped_update_norm, clipping_factor, noise_scale, noise_norm, signal_noise_ratio = privatize_update_delta(
-                delta,
-                mechanism=self.dp_mechanism,
-                epsilon=epsilon,
-                delta_value=self.dp_delta,
-                clip_norm=self.dp_clip_norm,
-                debug=self.dp_debug,
-                debug_prefix=f"[DP DEBUG][client={self.client_id}] ",
-            )
-            if self.dp_mechanism == "gaussian":
-                gaussian_std = noise_scale
-            else:
-                laplace_scale = noise_scale
-                dim = sum(v.numel() for v in sd.values() if v.is_floating_point())
-                # For iid Laplace(0, b), E||noise||_2 is on the order of sqrt(2 * d) * b.
-                laplace_expected_noise_l2 = math.sqrt(2.0 * float(dim)) * laplace_scale if dim > 0 else 0.0
-            # Client-level DP sends noisy deltas; the server adds them to the global model.
-            sd = {
-                key: torch.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
-                for key, value in sd.items()
-            }
-            is_model_delta = True
 
         sd = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in sd.items()}
 

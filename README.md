@@ -225,17 +225,15 @@ Round 01: Acc=95.12% Loss=0.1543 | Train=8.21s Encrypt=3.45s Agg=0.92s | Total=1
 
 ## Differential Privacy (DP)
 
-This project supports two DP algorithms and two noise mechanisms.
+This project supports DP-SGD with Gaussian and Laplace mechanisms.
 
-### DP Algorithms
+### DP Algorithm
 
 | Algorithm | Flag | Where DP is applied |
 |---|---|---|
 | DP-SGD | `--dp_mode dp_sgd` | During local training (per-example gradients) |
-| Client-level DP | `--dp_mode client_level` | After local training, on each client delta |
-| Server-level DP | `--dp_mode server_level` | On server, after clipping client deltas and aggregating |
 
-#### 1) DP-SGD (`--dp_mode dp_sgd`)
+#### DP-SGD (`--dp_mode dp_sgd`)
 
 ```text
 for each batch:
@@ -248,38 +246,7 @@ for each batch:
 ```
 
 - Strong per-example control.
-- More private-training style, but slower (per-example gradient loop).
 - In this repo: Gaussian DP-SGD uses L2 clipping; Laplace DP-SGD uses L1 clipping.
-
-#### 2) Client-level DP (`--dp_mode client_level`)
-
-```text
-train locally (standard SGD)
-delta = local_model - global_model
-flatten delta
-clip once
-add calibrated noise once
-send noisy delta to server
-server averages
-```
-
-- Faster than DP-SGD.
-- Usually noisier at the same epsilon because the full high-dimensional update is privatized.
-
-#### 3) Server-level DP (`--dp_mode server_level`)
-
-```text
-clients train locally (no local DP)
-clients send model deltas
-server clips each client delta
-server computes weighted average delta
-server adds DP noise once to aggregated delta
-server updates global model
-```
-
-- Fast client-side training (no per-example DP on clients).
-- Central/trusted-server DP design.
-- Not compatible with encrypted aggregation in current implementation (needs plaintext deltas for clipping).
 
 ### DP Mechanisms
 
@@ -307,7 +274,7 @@ Clipping directly sets sensitivity. Noise is calibrated from this effective clip
 | Parameter | Default | Description |
 |---|---:|---|
 | `--use_dp` | off | Enables DP |
-| `--dp_mode` | `client_level` | `dp_sgd`, `client_level`, or `server_level` |
+| `--dp_mode` | `dp_sgd` | `dp_sgd` |
 | `--dp_mechanism` | `gaussian` | `gaussian` or `laplace` |
 | `--dp_epsilon` | `1.0` | Per-round epsilon used by runner |
 | `--dp_target_delta` | `1e-5` | Delta for Gaussian |
@@ -367,42 +334,6 @@ Example (DP-SGD + Laplace + adaptive clipping):
 python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
 ```
 
-### How To Run Client-level DP with different clipping strategies
-
-#### Client-level + fixed clipping
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy fixed --dp_clip_norm 1.0
-```
-
-#### Client-level + quantile clipping
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy quantile --dp_clip_quantile 50 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
-```
-
-#### Client-level + adaptive clipping
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode client_level --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
-```
-
-### How To Run Server-level DP
-
-#### Server-level + Gaussian + adaptive clipping
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode server_level --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
-```
-
-#### Server-level + Laplace + fixed clipping
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode server_level --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy fixed --dp_clip_norm 1.0
-```
-
----
-
 ### Debugging DP behavior
 
 Use:
@@ -452,8 +383,6 @@ Quick rules of thumb:
 2. DP-SGD + Gaussian + adaptive clipping.
 3. DP-SGD + Gaussian + fixed clipping.
 4. DP-SGD + Laplace + adaptive clipping.
-5. Client-level + Gaussian.
-6. Client-level + Laplace.
 
 Note: `local_epochs > 3` can hurt privacy/utility balance in DP runs; runner prints a warning.
 
