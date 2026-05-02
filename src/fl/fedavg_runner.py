@@ -1,4 +1,5 @@
 import argparse
+import copy
 import math
 import random
 import time
@@ -18,7 +19,7 @@ from src.fl.partitions import iid_partitions, dirichlet_partitions
 from src.fl.client import Client
 from src.fl.aggregator import Aggregator
 from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
-from src.privacy.dp_utils import compute_epsilon
+from src.privacy.dp_utils import compute_laplace_epsilon, gaussian_noise_scale
 
 
 def warmup_cosine_lr(base_lr: float, current_round: int, total_rounds: int, warmup_rounds: int) -> float:
@@ -107,6 +108,16 @@ def _run_fl_rounds(global_model, partitions, train_ds, test_loader, device, conf
                     aggregator, encryption_ctx, dp_clip_norm, use_dp,
                     num_rounds, lr, label="Round", ema=None):
     """Shared FL round loop used by both baseline/pretrain and main DP phases."""
+    dp_mode = getattr(config, "dp_mode", "dp_sgd")
+    dp_mechanism = getattr(config, "dp_mechanism", "gaussian")
+    dp_clip_strategy = getattr(config, "dp_clip_strategy", "adaptive")
+    dp_noise_multiplier = getattr(config, "dp_noise_multiplier", 0.0)
+    dp_epsilon = getattr(config, "dp_epsilon", 1.0)
+    dp_laplace_epsilon = getattr(config, "dp_laplace_epsilon", 5.0)
+    # Laplace epsilon is static per round (no automatic division by num_rounds).
+    dp_laplace_epsilon_per_round = dp_epsilon if dp_epsilon > 0 else dp_laplace_epsilon
+    dp_delta = getattr(config, "dp_target_delta", 1e-5)
+    dp_debug = getattr(config, "dp_debug", False)
     results = []
     for rnd in range(1, num_rounds + 1):
         round_start = time.time()
@@ -120,6 +131,15 @@ def _run_fl_rounds(global_model, partitions, train_ds, test_loader, device, conf
                 scheduler=config.scheduler,
                 encryption_context=encryption_ctx,
                 dp_clip_norm=dp_clip_norm if use_dp else None,
+                dp_mechanism=dp_mechanism if use_dp else "gaussian",
+                dp_epsilon=dp_epsilon if use_dp else 0.0,
+                dp_delta=dp_delta,
+                dp_debug=dp_debug and use_dp,
+                dp_clip_strategy=dp_clip_strategy if use_dp else "fixed",
+                dp_clip_quantile=getattr(config, "dp_clip_quantile", 50.0),
+                dp_clip_alpha=getattr(config, "dp_clip_alpha", 0.9),
+                dp_clip_min=getattr(config, "dp_clip_min", 0.1),
+                dp_clip_max=getattr(config, "dp_clip_max", 10.0),
             )
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
@@ -127,6 +147,11 @@ def _run_fl_rounds(global_model, partitions, train_ds, test_loader, device, conf
         if ema is not None:
             ema.update(global_model)
         acc, loss = evaluate(global_model, test_loader, device)
+        if math.isnan(loss):
+            print(f"[DP DEBUG] LOSS IS NAN after {label} {rnd}")
+            raise SystemExit(1)
+        if loss > 1e5:
+            print(f"[DP DEBUG] WARNING: loss explosion after {label} {rnd}: loss={loss:.6f}")
         round_time = time.time() - round_start
         results.append((rnd, acc, loss, round_time))
         print(f"  {label} {rnd:02d}: Acc={acc*100:.2f}% Loss={loss:.4f} | Time={round_time:.2f}s")
@@ -196,18 +221,51 @@ def run(config):
 
     dp_clip_norm = getattr(config, "dp_clip_norm", 1.0)
     dp_noise_multiplier = getattr(config, "dp_noise_multiplier", 0.0)
+    dp_epsilon = getattr(config, "dp_epsilon", 1.0)
     dp_target_delta = getattr(config, "dp_target_delta", 1e-5)
+    dp_mode = getattr(config, "dp_mode", "dp_sgd")
+    dp_mechanism = getattr(config, "dp_mechanism", "gaussian")
+    dp_clip_strategy = getattr(config, "dp_clip_strategy", "adaptive")
+    dp_laplace_epsilon = getattr(config, "dp_laplace_epsilon", 5.0)
     warmup_rounds = getattr(config, "warmup_rounds", 0)
     use_ema = getattr(config, "use_ema", False)
     ema_decay = getattr(config, "ema_decay", 0.999)
     pretrain_rounds = getattr(config, "pretrain_rounds", 0)
     baseline_compare = getattr(config, "baseline_compare", False)
+    dp_debug = getattr(config, "dp_debug", False)
+
+    if use_dp and dp_mode != "dp_sgd":
+        raise ValueError(f"Unsupported dp_mode: {dp_mode}")
+
+    if use_dp and dp_mechanism not in {"gaussian", "laplace"}:
+        raise ValueError(f"Unsupported dp_mechanism: {dp_mechanism}")
+
+    if use_dp and dp_epsilon <= 0:
+        raise ValueError("For DP, --dp_epsilon must be > 0.")
+
+    if use_dp and dp_mechanism == "laplace" and dp_laplace_epsilon <= 0:
+        raise ValueError("For Laplace DP, --dp_laplace_epsilon must be > 0.")
+
+    dp_laplace_epsilon_per_round = 0.0
+    if use_dp and dp_mechanism == "laplace":
+        # Laplace epsilon is interpreted as per-round epsilon.
+        dp_laplace_epsilon_per_round = dp_epsilon if dp_epsilon > 0 else dp_laplace_epsilon
 
     aggregator = Aggregator(
         encryption_context=encryption_ctx,
-        dp_clip_norm=dp_clip_norm,
-        dp_noise_multiplier=dp_noise_multiplier if use_dp else 0.0,
     )
+
+    if use_dp and pretrain_rounds > 0:
+        raise ValueError(
+            "pretrain_rounds > 0 is incompatible with a valid DP claim. "
+            "Run pretraining as a separate non-DP experiment, then run DP with --pretrain_rounds 0."
+        )
+
+    if use_dp and config.local_epochs > 3:
+        print(
+            f"[DP WARNING] local_epochs={config.local_epochs} applies multiple local passes before one DP release. "
+            "Keep local_epochs <= 3 for meaningful, stable round-level DP comparisons."
+        )
 
     if config.use_encryption and use_dp:
         mode = "HE+DP"
@@ -226,19 +284,46 @@ def run(config):
         print("[HE] Encryption: DISABLED for this run")
 
     if use_dp:
-        epsilon = compute_epsilon(
-            noise_multiplier=dp_noise_multiplier,
-            num_rounds=config.rounds,
-            target_delta=dp_target_delta,
-        )
+        cumulative_epsilon = dp_epsilon * config.rounds
+        if dp_mechanism == "gaussian":
+            noise_scale = gaussian_noise_scale(
+                epsilon=dp_epsilon,
+                delta=dp_target_delta,
+                clip_norm=dp_clip_norm,
+            )
+            cumulative_delta = dp_target_delta * config.rounds
+            print(
+                f"[DP] enabled: mode={dp_mode} mechanism=gaussian "
+                f"eps/round={dp_epsilon:.4f} delta/round={dp_target_delta:.0e} "
+                f"clip={dp_clip_norm:.4f} noise_scale={noise_scale:.4f}"
+            )
+            print(
+                f"[DP] planned privacy budget after {config.rounds} rounds: "
+                f"epsilon~{cumulative_epsilon:.4f} delta~{cumulative_delta:.0e}"
+            )
+        else:
+            epsilon_total = compute_laplace_epsilon(
+                epsilon_per_round=dp_laplace_epsilon_per_round,
+                num_rounds=config.rounds,
+            )
+            noise_scale = dp_clip_norm / dp_laplace_epsilon_per_round
+            print(
+                f"[DP] enabled: mode={dp_mode} mechanism=laplace "
+                f"eps/round={dp_laplace_epsilon_per_round:.4f} delta=0 "
+                f"clip={dp_clip_norm:.4f} noise_scale={noise_scale:.4f}"
+            )
+            print(
+                f"[DP] planned privacy budget after {config.rounds} rounds: "
+                f"epsilon={epsilon_total:.4f} delta=0"
+            )
         print(
-            f"[DP] ACTIVE | clip_norm={dp_clip_norm}  noise_multiplier={dp_noise_multiplier}  "
-            f"delta={dp_target_delta:.0e}  ~ epsilon={epsilon:.4f}"
+            f"[DP] clipping: strategy={dp_clip_strategy} "
+            f"quantile={getattr(config, 'dp_clip_quantile', 50.0)} "
+            f"alpha={getattr(config, 'dp_clip_alpha', 0.9)} "
+            f"range=[{getattr(config, 'dp_clip_min', 0.1)}, {getattr(config, 'dp_clip_max', 10.0)}]"
         )
         if warmup_rounds > 0:
             print(f"[DP] LR schedule: {warmup_rounds} warmup rounds + cosine decay over {config.rounds} rounds")
-        if pretrain_rounds > 0:
-            print(f"[DP] Pre-training {pretrain_rounds} rounds without DP noise")
     else:
         print("[DP] Differential Privacy: DISABLED for this run")
 
@@ -254,7 +339,7 @@ def run(config):
         baseline_model = type(global_model)().to(device)
         baseline_model.load_state_dict(global_model.state_dict())
         baseline_agg = Aggregator(
-            encryption_context=encryption_ctx, dp_clip_norm=dp_clip_norm, dp_noise_multiplier=0.0,
+            encryption_context=encryption_ctx,
         )
         baseline_results = _run_fl_rounds(
             baseline_model, partitions, train_ds, test_loader, device, config,
@@ -276,34 +361,6 @@ def run(config):
         ema = EMAModel(global_model, decay=ema_decay)
         print(f"[EMA] Enabled with decay={ema_decay}")
 
-    # ----------------------------------------------------------------
-    # Phase 1 (optional): Non-private pretraining
-    # ----------------------------------------------------------------
-    if pretrain_rounds > 0 and use_dp:
-        print(f"\n{'='*60}")
-        print(f"Phase 1: Non-private pretraining ({pretrain_rounds} rounds)")
-        print(f"{'='*60}")
-        pretrain_agg = Aggregator(
-            encryption_context=encryption_ctx, dp_clip_norm=dp_clip_norm, dp_noise_multiplier=0.0,
-        )
-        _run_fl_rounds(
-            global_model, partitions, train_ds, test_loader, device, config,
-            pretrain_agg, encryption_ctx, dp_clip_norm=None, use_dp=False,
-            num_rounds=pretrain_rounds, lr=config.lr, label="Pretrain",
-        )
-        del pretrain_agg
-        if ema is not None:
-            ema = EMAModel(global_model, decay=ema_decay)
-        print()
-
-    # ----------------------------------------------------------------
-    # Phase 2: Main training loop (with DP if enabled)
-    # ----------------------------------------------------------------
-    if pretrain_rounds > 0 and use_dp:
-        print(f"{'='*60}")
-        print(f"Phase 2: DP training ({config.rounds} rounds)")
-        print(f"{'='*60}")
-
     for rnd in range(1, config.rounds + 1):
         round_start = time.time()
 
@@ -323,15 +380,40 @@ def run(config):
                 scheduler=config.scheduler,
                 encryption_context=encryption_ctx,
                 dp_clip_norm=dp_clip_norm if use_dp else None,
+                dp_mechanism=dp_mechanism if use_dp else "gaussian",
+                dp_epsilon=dp_epsilon if use_dp else 0.0,
+                dp_delta=dp_target_delta,
+                dp_debug=dp_debug and use_dp,
+                dp_clip_strategy=dp_clip_strategy if use_dp else "fixed",
+                dp_clip_quantile=getattr(config, "dp_clip_quantile", 50.0),
+                dp_clip_alpha=getattr(config, "dp_clip_alpha", 0.9),
+                dp_clip_min=getattr(config, "dp_clip_min", 0.1),
+                dp_clip_max=getattr(config, "dp_clip_max", 10.0),
             )
             update = client.train(global_model, epochs=config.local_epochs)
             client_updates.append(update)
 
         total_train_time = sum(u.train_time for u in client_updates)
         total_encrypt_time = sum(u.encrypt_time for u in client_updates)
+
         agg_start = time.time()
         aggregator.federated_average(client_updates, global_model)
         agg_time = time.time() - agg_start
+
+        dp_stats_str = ""
+        if use_dp and dp_mechanism in {"gaussian", "laplace"}:
+            raw_norm_avg = sum(u.raw_update_norm for u in client_updates) / len(client_updates)
+            clipped_norm_avg = sum(u.clipped_update_norm for u in client_updates) / len(client_updates)
+            clip_factor_avg = sum(u.clipping_factor for u in client_updates) / len(client_updates)
+            noise_norm_avg = sum(u.noise_norm for u in client_updates) / len(client_updates)
+            signal_noise_ratio_avg = sum(u.signal_noise_ratio for u in client_updates) / len(client_updates)
+            noise_scale = client_updates[0].noise_scale if client_updates else 0.0
+            dp_stats_str = (
+                f" | DP(raw={raw_norm_avg:.3f} clip={clipped_norm_avg:.3f} factor={clip_factor_avg:.3f} "
+                f"noise_scale={noise_scale:.3f} noise_norm={noise_norm_avg:.3f} n/s={signal_noise_ratio_avg:.3f})"
+            )
+            if signal_noise_ratio_avg > 10.0:
+                dp_stats_str += " [warn: noise dominates]"
 
         if ema is not None:
             ema.update(global_model)
@@ -348,6 +430,12 @@ def run(config):
         else:
             acc, loss = evaluate(global_model, test_loader, device)
 
+        if math.isnan(loss):
+            print(f"[DP DEBUG][round={rnd}] LOSS IS NAN")
+            raise SystemExit(1)
+        if loss > 1e5:
+            print(f"[DP DEBUG][round={rnd}] WARNING: loss explosion loss={loss:.6f}")
+
         round_time = time.time() - round_start
         round_times.append(round_time)
         elapsed = time.time() - start_time
@@ -355,11 +443,13 @@ def run(config):
         # Per-round privacy budget
         eps_str = ""
         if use_dp:
-            round_eps = compute_epsilon(
-                noise_multiplier=dp_noise_multiplier,
-                num_rounds=rnd,
-                target_delta=dp_target_delta,
-            )
+            if dp_mechanism == "gaussian":
+                round_eps = dp_epsilon * rnd
+            else:
+                round_eps = compute_laplace_epsilon(
+                    epsilon_per_round=dp_laplace_epsilon_per_round,
+                    num_rounds=rnd,
+                )
             eps_str = f" eps={round_eps:.4f}"
 
         lr_str = f" LR={current_lr:.6f}" if use_dp and warmup_rounds > 0 else ""
@@ -367,19 +457,23 @@ def run(config):
         print(
             f"Round {rnd:02d}: Acc={acc*100:.2f}%{ema_str} Loss={loss:.4f}{eps_str}{lr_str} "
             f"| Train={total_train_time:.2f}s Encrypt={total_encrypt_time:.2f}s "
-            f"Agg={agg_time:.2f}s | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
+            f"Agg={agg_time:.2f}s{dp_stats_str} | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
         )
 
     # ----------------------------------------------------------------
     # Summary
     # ----------------------------------------------------------------
     if use_dp:
-        final_eps = compute_epsilon(
-            noise_multiplier=dp_noise_multiplier,
-            num_rounds=config.rounds,
-            target_delta=dp_target_delta,
-        )
-        print(f"\n[DP Summary] Final epsilon={final_eps:.4f}, delta={dp_target_delta:.0e}")
+        if dp_mechanism == "gaussian":
+            final_eps = dp_epsilon * config.rounds
+            final_delta = dp_target_delta * config.rounds
+            print(f"\n[DP Summary] mode={dp_mode} mechanism=gaussian Final epsilon~{final_eps:.4f}, delta~{final_delta:.0e}")
+        else:
+            final_eps = compute_laplace_epsilon(
+                epsilon_per_round=dp_laplace_epsilon_per_round,
+                num_rounds=config.rounds,
+            )
+            print(f"\n[DP Summary] mode={dp_mode} mechanism=laplace Final epsilon={final_eps:.4f}, delta=0")
         if ema is not None:
             print(f"[EMA] Final EMA accuracy: {acc*100:.2f}%")
 
@@ -387,6 +481,21 @@ def run(config):
         ema.apply_to(global_model)
 
     return global_model
+
+
+def run_dp_mechanism_comparison(config, mechanisms=("gaussian", "laplace")):
+    """Run the same DP-FedAvg configuration once per mechanism."""
+    results = {}
+    for mechanism in mechanisms:
+        cfg = copy.deepcopy(config)
+        cfg.use_dp = True
+        cfg.dp_mechanism = mechanism
+        cfg.compare_dp_mechanisms = False
+        print(f"\n{'='*72}")
+        print(f"DP mechanism comparison: {mechanism}")
+        print(f"{'='*72}")
+        results[mechanism] = run(cfg)
+    return results
 
 
 def parse_args():
@@ -418,8 +527,26 @@ def parse_args():
                    help="Differential Privacy'yi etkinleştir (DP-FedAvg).")
     p.add_argument("--dp_clip_norm", type=float, default=1.0,
                    help="DP için L2 clip normu (varsayılan: 1.0).")
+    p.add_argument("--dp_clip_strategy", choices=["fixed", "quantile", "adaptive"], default="adaptive",
+                   help="DP-SGD clipping strategy. Uses per-example gradient norms.")
+    p.add_argument("--dp_clip_quantile", type=float, default=50.0,
+                   help="Norm percentile for quantile/adaptive clipping.")
+    p.add_argument("--dp_clip_alpha", type=float, default=0.9,
+                   help="Moving-average smoothing factor for adaptive clipping.")
+    p.add_argument("--dp_clip_min", type=float, default=0.1,
+                   help="Minimum clamp for quantile/adaptive clip norm.")
+    p.add_argument("--dp_clip_max", type=float, default=10.0,
+                   help="Maximum clamp for quantile/adaptive clip norm.")
+    p.add_argument("--dp_mode", choices=["dp_sgd"], default="dp_sgd",
+                   help="DP mode. Only dp_sgd is supported.")
+    p.add_argument("--dp_mechanism", choices=["gaussian", "laplace"], default="gaussian",
+                   help="DP mekanizmasi: gaussian veya laplace.")
+    p.add_argument("--dp_epsilon", type=float, default=1.0,
+                   help="Round-basina epsilon. Gaussian ve Laplace mekanizmalari icin ortak karsilastirma parametresi.")
     p.add_argument("--dp_noise_multiplier", type=float, default=0.01,
-                   help="Gaussian gürültü çarpanı sigma/S (varsayılan: 0.01). Büyüdükçe epsilon küçülür, model doğruluğu düşer.")
+                   help="Deprecated compatibility option; Gaussian noise is calibrated from --dp_epsilon and --dp_target_delta.")
+    p.add_argument("--dp_laplace_epsilon", type=float, default=5.0,
+                   help="Laplace mekanizmasi icin round-basina sabit epsilon (delta=0).")
     p.add_argument("--dp_target_delta", type=float, default=1e-5,
                    help="Hedef delta değeri (varsayılan: 1e-5).")
     # DP accuracy improvements
@@ -430,13 +557,20 @@ def parse_args():
     p.add_argument("--ema_decay", type=float, default=0.999,
                    help="EMA decay oranı (varsayılan: 0.999).")
     p.add_argument("--pretrain_rounds", type=int, default=0,
-                   help="DP öncesi non-private ön-eğitim round sayısı.")
+                   help="Non-private pretraining rounds (do not use in DP mode).")
     p.add_argument("--baseline_compare", action="store_true",
                    help="DP çalıştırmadan önce non-private baseline ölç.")
+    p.add_argument("--compare_dp_mechanisms", action="store_true",
+                   help="Ayni ayarlarla gaussian ve laplace DP mekanizmalarini sirayla calistir.")
+    p.add_argument("--dp_debug", action="store_true",
+                   help="Print step-by-step DP tensor diagnostics and stop on NaN/Inf.")
     p.add_argument("--no_cuda", action="store_true")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run(args)
+    if args.compare_dp_mechanisms:
+        run_dp_mechanism_comparison(args)
+    else:
+        run(args)
