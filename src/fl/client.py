@@ -160,6 +160,7 @@ class Client:
             clipping_factor = dp_sgd_stats["clip_factor"]
             noise_norm = dp_sgd_stats["noise_norm"]
             noise_scale = dp_sgd_stats["noise_scale"]
+            signal_noise_ratio = noise_norm / (clipped_update_norm + 1e-12)
             if self.dp_mechanism == "gaussian":
                 gaussian_std = noise_scale
             else:

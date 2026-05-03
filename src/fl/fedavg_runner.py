@@ -1,9 +1,11 @@
 import argparse
+import csv
 import copy
 import math
+import os
 import random
 import time
-from typing import List
+from typing import Dict, List
 
 import torch
 from torch.utils.data import DataLoader
@@ -20,6 +22,42 @@ from src.fl.client import Client
 from src.fl.aggregator import Aggregator
 from src.he.encryption import PlainContext, HomomorphicContext, PaillierContext
 from src.privacy.dp_utils import compute_laplace_epsilon, gaussian_noise_scale
+
+
+def _append_csv_row(csv_path: str, row: Dict[str, object]):
+    fieldnames = [
+        "timestamp",
+        "round",
+        "dataset",
+        "model",
+        "num_clients",
+        "scheme",
+        "payload_mode",
+        "training_time",
+        "encrypt_time",
+        "aggregate_time",
+        "decrypt_time",
+        "he_total_time",
+        "total_round_time",
+        "ciphertext_count",
+        "encrypted_values",
+        "payload_nbytes",
+        "accuracy",
+        "loss",
+        "mean_abs_error",
+        "max_abs_error",
+        "analytics_reference",
+        "analytics_decrypted",
+        "integer_reference",
+        "integer_decrypted",
+    ]
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    write_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def warmup_cosine_lr(base_lr: float, current_round: int, total_rounds: int, warmup_rounds: int) -> float:
@@ -162,6 +200,7 @@ def run(config):
     set_seed(config.seed)
     device = torch.device("cuda" if (not config.no_cuda and torch.cuda.is_available()) else "cpu")
     use_dp = getattr(config, "use_dp", False)
+    payload_mode = getattr(config, "payload_mode", "full_model")
 
     # Auto-enable augmentation for DP CIFAR-10
     use_aug = config.use_aug
@@ -460,6 +499,44 @@ def run(config):
             f"Agg={agg_time:.2f}s{dp_stats_str} | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
         )
 
+        if getattr(config, "save_metrics_csv", None):
+            model_name = getattr(config, "ptbxl_model", "-") if config.dataset == "ptbxl" else type(global_model).__name__
+            if use_dp and config.use_encryption:
+                scheme_name = f"{getattr(config, 'encryption_scheme', 'he')}+dp_{dp_mechanism}"
+            elif use_dp:
+                scheme_name = f"dp_{dp_mechanism}"
+            elif config.use_encryption:
+                scheme_name = getattr(config, "encryption_scheme", "none")
+            else:
+                scheme_name = "none"
+            row = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "round": rnd,
+                "dataset": config.dataset,
+                "model": model_name,
+                "num_clients": config.num_clients,
+                "scheme": scheme_name,
+                "payload_mode": payload_mode,
+                "training_time": round(total_train_time, 6),
+                "encrypt_time": round(total_encrypt_time, 6),
+                "aggregate_time": round(agg_time, 6),
+                "decrypt_time": 0.0,
+                "he_total_time": round(total_encrypt_time + agg_time, 6),
+                "total_round_time": round(round_time, 6),
+                "ciphertext_count": 0,
+                "encrypted_values": 0,
+                "payload_nbytes": 0,
+                "accuracy": round(acc, 6),
+                "loss": round(loss, 6),
+                "mean_abs_error": 0.0,
+                "max_abs_error": 0.0,
+                "analytics_reference": "",
+                "analytics_decrypted": "",
+                "integer_reference": "",
+                "integer_decrypted": "",
+            }
+            _append_csv_row(config.save_metrics_csv, row)
+
     # ----------------------------------------------------------------
     # Summary
     # ----------------------------------------------------------------
@@ -564,6 +641,10 @@ def parse_args():
                    help="Ayni ayarlarla gaussian ve laplace DP mekanizmalarini sirayla calistir.")
     p.add_argument("--dp_debug", action="store_true",
                    help="Print step-by-step DP tensor diagnostics and stop on NaN/Inf.")
+    p.add_argument("--payload_mode", choices=["full_model", "analytics", "integer_stats"], default="full_model",
+                   help="CSV/plot compatibility field. The current runner uses full-model FL updates.")
+    p.add_argument("--save_metrics_csv", type=str, default=None,
+                   help="Optional CSV path for per-round metrics export.")
     p.add_argument("--no_cuda", action="store_true")
     return p.parse_args()
 

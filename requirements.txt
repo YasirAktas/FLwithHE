@@ -7,6 +7,7 @@ pyyaml
 wfdb
 pandas
 numpy
+matplotlib
 
 # Optional HE libraries (uncomment and install when needed)
 tenseal

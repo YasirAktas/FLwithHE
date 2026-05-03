@@ -5,6 +5,7 @@ Provides:
 - PaillierContext: additive partial HE via Paillier (integer-only scheme)
 """
 from typing import Any, Tuple
+import math
 import torch
 try:
     import tenseal as ts
@@ -28,6 +29,18 @@ class PlainContext:
 
     def mul_scalar(self, a, s: float):
         return a * s
+
+    def is_encrypted(self, obj: Any) -> bool:
+        return False
+
+    def ciphertext_count(self, obj: Any) -> int:
+        return 0
+
+    def encrypted_values(self, obj: Any) -> int:
+        return 0
+
+    def payload_nbytes(self, obj: Any) -> int:
+        return 0
 
 class HomomorphicContext:
     def __init__(self, poly_modulus_degree: int = 8192, coeff_mod_bit_sizes: Tuple[int, ...] = (60, 40, 40, 60), global_scale: float = 2 ** 40):
@@ -71,6 +84,22 @@ class HomomorphicContext:
     def mul_scalar(self, a: "HomomorphicContext.EncryptedTensor", s: float):
         cts = [ca * s for ca in a.cts]
         return HomomorphicContext.EncryptedTensor(cts, a.shape)
+
+    def is_encrypted(self, obj: Any) -> bool:
+        return isinstance(obj, HomomorphicContext.EncryptedTensor)
+
+    def ciphertext_count(self, obj: "HomomorphicContext.EncryptedTensor") -> int:
+        return len(obj.cts)
+
+    def encrypted_values(self, obj: "HomomorphicContext.EncryptedTensor") -> int:
+        return math.prod(obj.shape)
+
+    def payload_nbytes(self, obj: "HomomorphicContext.EncryptedTensor") -> int:
+        total = 0
+        for ct in obj.cts:
+            if hasattr(ct, "serialize"):
+                total += len(ct.serialize())
+        return total
 
 
 class PaillierContext:
@@ -137,3 +166,17 @@ class PaillierContext:
         k = int(s)
         cts = [ct * k for ct in a.cts]
         return PaillierContext.EncryptedTensor(cts, a.shape)
+
+    def is_encrypted(self, obj: Any) -> bool:
+        return isinstance(obj, PaillierContext.EncryptedTensor)
+
+    def ciphertext_count(self, obj: "PaillierContext.EncryptedTensor") -> int:
+        return len(obj.cts)
+
+    def encrypted_values(self, obj: "PaillierContext.EncryptedTensor") -> int:
+        return math.prod(obj.shape)
+
+    def payload_nbytes(self, obj: "PaillierContext.EncryptedTensor") -> int:
+        # Paillier ciphertext is modulo n^2 => at most ~2*|n| bits.
+        per_ct = (2 * self.public_key.n.bit_length() + 7) // 8
+        return len(obj.cts) * per_ct

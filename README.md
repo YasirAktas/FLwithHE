@@ -1,469 +1,516 @@
-# FLwithHE Project
+# FLwithHE
 
-Modüler Federated Learning (FedAvg) örneği + Homomorfik Şifreleme (HE) için altyapı iskeleti.
+Federated Learning (`FedAvg`) research codebase with:
+- Homomorphic Encryption (HE): `CKKS` and `Paillier`
+- Differential Privacy (DP-SGD): `Gaussian` and `Laplace`
+- Optional combined mode: `HE + DP`
 
-## Klasör Yapısı
-```
+This README is a code-level reference for the current implementation.
+
+## 1. Scope and Current Behavior
+
+The primary executable is:
+- `python3 -m src.fl.fedavg_runner`
+
+Current runner behavior is **full-model federated training/aggregation** with optional:
+- client-side DP-SGD
+- encrypted client payload transport and encrypted aggregation
+
+`payload_mode` is currently kept for CSV/plot compatibility and experiment labeling.
+
+---
+
+## 2. Repository Map (HE/DP Relevant)
+
+```text
 src/
   fl/
-    partitions.py        # IID ve Dirichlet veri bölme
-    client.py            # İstemci eğitimi
-    aggregator.py        # Federated averaging + HE kancası
-    fedavg_runner.py     # Ana çalışma scripti (modüler)
-  models/
-    mnist_cnn.py         # MNIST için küçük CNN
-    cifar_cnn.py         # CIFAR-10 için ResNet-18 (CIFAR'a uyarlanmış)
+    fedavg_runner.py        # main experiment runner
+    client.py               # local training, DP-SGD, optional client-side HE encryption
+    aggregator.py           # weighted aggregation; supports mixed encrypted/plain params
+    dp_grid_search.py       # CIFAR-10 DP mechanism/epsilon/clip sweep utility
+    partitions.py           # iid / dirichlet partitioning
+
   he/
-    encryption.py        # PlainContext ve TenSEAL CKKS tabanlı HomomorphicContext
-config/
-  default.yaml           # Varsayılan hiperparametreler
-requirements.txt
-README.md
+    encryption.py           # PlainContext, HomomorphicContext(CKKS), PaillierContext
+
+  privacy/
+    dp_utils.py             # clipping, noise calibration, per-example DP-SGD,
+                            # OpenDP helpers, epsilon estimators
+
+  utils/
+    plot_he_comparison.py   # CSV-based plotting and summaries
 ```
-
-## Kurulum
-```cmd
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-(Opsiyonel) GPU veya özel HE kütüphanesi için resmi kurulum komutlarını ayrıca çalıştırın.
-
-## Adım Adım Çalıştırma (Windows CMD)
-1) Proje klasörüne girin
-```cmd
-cd .\FLwithHE
-```
-
-2) (Yoksa) sanal ortam oluşturun
-```cmd
-python -m venv .venv
-```
-
-3) Ortamı aktif edin
-```cmd
-.\.venv\Scripts\activate
-```
-
-4) Bağımlılıkları kurun
-```cmd
-pip install -r requirements.txt
-```
-
-5) Modüler runner 
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
-```
-
-6) CIFAR-10 ile çalıştırma
-```cmd
-python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 40 --local_epochs 3 --partition iid --use_aug --weight_decay 0.0005 --scheduler cosine
-```
-
-7) Non-IID (Dirichlet) veri dağılımı
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --partition dirichlet --dirichlet_alpha 0.3
-```
-Açıklama:
-- `partition=dirichlet`: Sınıf dağılımını istemciler arasında dengesiz (heterojen) yapar.
-- `dirichlet_alpha`: Küçük değer → daha heterojen (bazı istemciler bazı sınıfları daha çok görür). Büyük değer → IID'ye yaklaşır.
-Örn. `alpha=0.3` daha gerçekçi, heterojen bir dağılım üretir; yakınsama IID'ye göre biraz daha yavaş olabilir.
-
-7) CUDA kapatma/açma
-- Kapatma: `--no_cuda`
-- Açık bırakmak için ek bir bayrak gerekmez (GPU varsa otomatik kullanılır)
-
-Örnek:
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 3 --no_cuda
-```
-
-8) Homomorfik Şifreleme (HE) ile çalıştırma
-
-CKKS (varsayılan, TenSEAL tabanlı — tam model şifreleme):
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme ckks
-```
-
-Paillier (python-paillier tabanlı — yalnızca son katman şifrelenir, daha hızlı):
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme paillier
-```
-
-Notlar:
-- `--use_encryption` aktifken istemci güncellemeleri HE ile şifrelenir ve sunucu tarafında ağırlıklı ortalama şifreli olarak hesaplanır; yalnızca birleştirilmiş sonuç çözülür.
-- `ckks`: Tüm model parametrelerini şifreler. TenSEAL kurulu olmalıdır.
-- `paillier`: Yalnızca son katman (classifier) parametrelerini şifreler; diğer katmanlar düz metin kalır. `python-paillier` kurulu olmalıdır: `pip install python-paillier`.
-- Şifreleme süresi çıktıda `Encrypt=...s` olarak, aggregation süresi `Agg=...s` olarak raporlanır.
-
-10) Parametre özeti
-- `--num_clients`: İstemci sayısı
-- `--rounds`: Global tur sayısı
-- `--local_epochs`: Her istemcide epoch
-- `--batch_size`: Lokal batch boyutu
-- `--lr`: Öğrenme oranı
-- `--dataset`: `mnist` veya `cifar10`
-- `--partition`: `iid` veya `dirichlet`
-- `--dirichlet_alpha`: Non-IID şiddeti (küçükse daha heterojen)
-- `--use_encryption`: Şifreli toplama modunu tetikler
-- `--encryption_scheme`: `ckks` (varsayılan, TenSEAL) veya `paillier` (python-paillier)
-- `--no_cuda`: GPU kullanma
-
-11) Çıktılar
-Her turun sonunda:
-```
-Round XX: Acc=...% Loss=...
-```
-Global modelin test doğruluğu ve kaybı raporlanır.
-
-12) Tipik hatalar ve çözümler
-- MNIST indirme hatası: İnternet bağlantısını kontrol edin, tekrar deneyin.
-- CUDA uyarısı: `--no_cuda` kullanarak CPU’da çalıştırın.
-- Paket bulunamadı: Ortamın aktif olduğundan emin olun ve `pip install -r requirements.txt` çalıştırın.
-
-13) Temiz çıkış
-```cmd
-deactivate
-```
-
-## Çalıştırma (Modüler Runner)
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --partition iid
-```
-Dirichlet (non-IID) örneği:
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --partition dirichlet --dirichlet_alpha 0.3
-```
-CIFAR-10 örneği:
-```cmd
-python -m src.fl.fedavg_runner --dataset cifar10 --num_clients 5 --rounds 40 --local_epochs 3 --use_aug --weight_decay 0.0005 --scheduler cosine
-```
-Encryption (HE) aktif çalıştırma — CKKS:
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme ckks
-```
-Encryption (HE) aktif çalıştırma — Paillier:
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme paillier
-```
-CUDA kapatmak:
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --no_cuda
-```
-
-
-
-
-## Homomorfik Şifreleme
-
-- Amaç: İstemci ağırlık güncellemelerini gizlilik için şifreleyerek sunucunun bunları göremeden federated averaging yapması.
-- Kapsam: İstemci `state_dict` tensörleri şifrelenir; toplayıcı tarafında ağırlıklandırma (`mul_scalar`) ve toplama (`add`) şifreli yapılır; sonuç yalnızca birleşik ağırlıklı ortalama sonrası çözülür.
-
-### Desteklenen Şemalar
-
-| Şema | Kütüphane | Şifrelenen Parametreler | Hız | Hassasiyet |
-|---|---|---|---|---|
-| `ckks` (varsayılan) | TenSEAL | Tüm model | Yavaş | Yaklaşık (float) |
-| `paillier` | python-paillier | Yalnızca son katman | Daha hızlı | Tam (integer) |
-
-### Kurulum
-
-CKKS için:
-```cmd
-pip install tenseal
-```
-
-Paillier için:
-```cmd
-pip install python-paillier
-```
-
-- `requirements.txt` içinde her ikisi de listelidir.
-
-### Nasıl Etkinleştirilir?
-
-CKKS ile:
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme ckks
-```
-
-Paillier ile (son katman şifrelemesi, daha hızlı):
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --use_encryption --encryption_scheme paillier
-```
-
-- Konfigürasyon: [config/default.yaml](config/default.yaml) içinde `use_encryption: true` yapabilirsiniz.
-
-### API Özeti
-- [src/he/encryption.py](src/he/encryption.py)
-  - `PlainContext`: `encrypt(t)`, `decrypt(t)` no-op; `add(a,b)`, `mul_scalar(a,s)` düz tensör işlemleri.
-  - `HomomorphicContext`: TenSEAL CKKS ile çalışır. Parametreler: `poly_modulus_degree` (varsayılan 8192), `coeff_mod_bit_sizes` (60,40,40,60), `global_scale` ($2^{40}$). CKKS slot sayısı `poly_modulus_degree/2`.
-  - `PaillierContext`: python-paillier ile çalışır. Yalnızca son katman (`classifier`, `linear`, `model.fc`) parametrelerini şifreler; diğer katmanlar düz metin olarak iletilir.
-  - İç temsil: `EncryptedTensor` şifreli parçaların ve orijinal şeklin tutulduğu hafif bir kap.
-
-### Çıktıda Süre Raporlama
-
-Her round sonunda şifreleme ve aggregation süreleri ayrı ayrı gösterilir:
-```
-Round 01: Acc=95.12% Loss=0.1543 | Train=8.21s Encrypt=3.45s Agg=0.92s | Total=12.58s Elapsed=12.58s
-```
-
-### Performans ve Sınırlamalar
-- CKKS yaklaşık aritmetik kullanır; küçük sayısal farklar beklenir.
-- Paillier tam integer aritmetik kullanır; float parametreler ölçeklenerek dönüştürülür.
-- Büyük modellerde slot parçalama nedeniyle ek bellek ve zaman maliyeti oluşur.
-- Aynı HE bağlamı (anahtarlar/ölçek) istemci ve sunucu tarafında tutarlı olmalıdır.
-- HE açıkken eğitim tur süreleri anlamlı ölçüde artabilir.
-
-### Sorun Giderme
-- `ImportError: TenSEAL not installed`: Sanal ortam aktifken `pip install tenseal` çalıştırın.
-- `ImportError: phe not installed`: Sanal ortam aktifken `pip install python-paillier` çalıştırın.
-- Derleme/kurulum hataları: İlgili kütüphanenin platform kılavuzunu takip edin veya geçici olarak `--use_encryption` olmadan çalıştırın.
 
 ---
 
-## Differential Privacy (DP)
+## 3. Homomorphic Encryption (HE)
 
-This project supports DP-SGD with Gaussian and Laplace mechanisms.
+Implementation file:
+- [`src/he/encryption.py`](/Users/ezhermemeti/Desktop/DATABASE/FLwithHE/src/he/encryption.py)
 
-### DP Algorithm
+### 3.1 `PlainContext`
+No-op context with API-compatible methods:
+- `encrypt`, `decrypt`, `add`, `mul_scalar`
+- accounting helpers: `ciphertext_count`, `encrypted_values`, `payload_nbytes`
 
-| Algorithm | Flag | Where DP is applied |
-|---|---|---|
-| DP-SGD | `--dp_mode dp_sgd` | During local training (per-example gradients) |
+### 3.2 `HomomorphicContext` (CKKS)
+Uses TenSEAL:
+- constructor defaults:
+  - `poly_modulus_degree=8192`
+  - `coeff_mod_bit_sizes=(60,40,40,60)`
+  - `global_scale=2**40`
+- creates Galois keys
+- slot count: `n_slots = poly_modulus_degree // 2`
 
-#### DP-SGD (`--dp_mode dp_sgd`)
+Encrypted object:
+- `HomomorphicContext.EncryptedTensor`
+  - `cts`: list of `ckks_vector` chunks
+  - `shape`: original tensor shape
 
-```text
-for each batch:
-  for each sample:
-    compute grad_i
-    clip grad_i
-  average clipped grads
-  add calibrated noise
-  optimizer.step()
-```
+Operations:
+- `encrypt(tensor)` flattens/chunks by `n_slots`
+- `decrypt(enc)` reconstructs `float32` tensor
+- `add(a,b)` with shape/chunk checks
+- `mul_scalar(a,s)` supports floating scalar weights
 
-- Strong per-example control.
-- In this repo: Gaussian DP-SGD uses L2 clipping; Laplace DP-SGD uses L1 clipping.
+Accounting helpers:
+- `ciphertext_count = len(cts)`
+- `encrypted_values = math.prod(shape)`
+- `payload_nbytes = sum(len(ct.serialize()))`
 
-### DP Mechanisms
+### 3.3 `PaillierContext`
+Uses `phe` Paillier keypair:
+- constructor defaults:
+  - `key_length=2048`
+  - `scale=1e4` fixed-point scaling
+- sets `scalar_mode = "int"` (used by aggregator)
 
-| Mechanism | Flag | Privacy type | Calibration summary |
-|---|---|---|---|
-| Gaussian | `--dp_mechanism gaussian` | \((\epsilon,\delta)\)-DP | \(\sigma \propto \text{sensitivity}/\epsilon\), uses `--dp_target_delta` |
-| Laplace | `--dp_mechanism laplace` | \((\epsilon,0)\)-DP | \(b = \text{sensitivity}_{L1}/\epsilon\), `delta=0` |
+Encrypted object:
+- `PaillierContext.EncryptedTensor`
+  - `cts`: list of Paillier ciphertext objects
+  - `shape`: original tensor shape
+
+Quantization path:
+- `_encode`: `round(tensor * scale) -> int64`
+- `_decode`: `int / scale -> float32`
+
+Operations:
+- `encrypt`, `decrypt`
+- `add(a,b)`
+- `mul_scalar(a,s)` with `k = int(s)` (integer plaintext scalar multiplication)
+
+Accounting helpers:
+- `ciphertext_count = len(cts)`
+- `encrypted_values = math.prod(shape)`
+- `payload_nbytes` approximate via modulus bit length
+
+---
+
+## 4. Differential Privacy (DP)
+
+Core implementation:
+- [`src/privacy/dp_utils.py`](/Users/ezhermemeti/Desktop/DATABASE/FLwithHE/src/privacy/dp_utils.py)
+
+### 4.1 Primitive helpers
+- flatten/unflatten update tensors:
+  - `flatten_state_update`
+  - `unflatten_state_update`
+- validity/debug:
+  - `debug_tensor`
+  - `assert_finite_tensor`
+- clipping:
+  - `clip_update(update, clip_norm, norm_type)`
+
+### 4.2 Noise calibration
+- Gaussian:
+  - `gaussian_noise_scale(epsilon, delta, clip_norm)`
+  - formula: `sigma = clip_norm * sqrt(2 * log(1.25/delta)) / epsilon`
+- Laplace:
+  - `laplace_noise_scale(epsilon, clip_norm, dimension)`
+  - `laplace_l1_noise_scale(epsilon, l1_sensitivity)`
+
+### 4.3 Per-example DP-SGD
+Main API:
+- `apply_dp_sgd(model, data_loader, optimizer, mechanism, clip_norm, epsilon, delta, ...)`
+
+Current algorithm:
+1. For each batch, iterate each sample (`batch_size` micro-steps)
+2. Compute per-sample gradient vector
+3. Clip gradient (L2 for Gaussian, L1 for Laplace)
+4. Average clipped gradients
+5. Add calibrated noise to averaged gradient
+6. Write noisy gradient back and call `optimizer.step()`
+
+Clipping modes:
+- `fixed`
+- `quantile`
+- `adaptive` (EMA smoothed quantile + clamp)
+
+Returns aggregated diagnostics:
+- `raw_norm`, `clipped_norm`, `noise_norm`, `noise_scale`,
+  `clip_norm`, `clip_factor`, `steps`, `loss`
+
+### 4.4 Privacy accounting utilities
+- `compute_epsilon(...)` (Gaussian, OpenDP-first with RDP fallback)
+- `compute_laplace_epsilon(epsilon_per_round, num_rounds)`
+
+### 4.5 OpenDP aggregate helpers (optional)
+- `privatize_aggregate_with_opendp(...)`
+- used as utility functions; not the default runner path
+
+---
+
+## 5. Client Logic
+
+Implementation file:
+- [`src/fl/client.py`](/Users/ezhermemeti/Desktop/DATABASE/FLwithHE/src/fl/client.py)
+
+### 5.1 `ClientUpdate` structure
+`ClientUpdate` fields:
+- `state_dict`, `num_samples`
+- timing: `train_time`, `encrypt_time`
+- delta marker: `is_model_delta`
+- DP diagnostics:
+  - `raw_update_norm`, `clipped_update_norm`, `clipping_factor`
+  - `gaussian_std`, `laplace_scale`
+  - `noise_scale`, `noise_norm`, `signal_noise_ratio`
+  - `laplace_expected_noise_l2`
+
+### 5.2 Training modes
+- If `dp_clip_norm is None`: standard SGD training loop
+- Else: DP-SGD via `apply_dp_sgd`
+
+### 5.3 Encryption behavior
+After local training:
+- state is moved to CPU
+- if HE enabled:
+  - Paillier mode encrypts only final layer keys (mixed-mode transport)
+  - CKKS mode encrypts all parameters
+
+Final-layer key detection:
+- `classifier.3.*`
+- `linear.*`
+- `model.fc.*`
+- `fc.*`, `fc2.*`, `fc3.*`
+
+---
+
+## 6. Aggregation Logic
+
+Implementation file:
+- [`src/fl/aggregator.py`](/Users/ezhermemeti/Desktop/DATABASE/FLwithHE/src/fl/aggregator.py)
+
+`Aggregator.federated_average(updates, global_model)`:
+
+1. Compute weighted aggregation by `num_samples`
+2. If HE context exists:
+   - **Paillier (`scalar_mode == int`)**:
+     - detect per-parameter encrypted/plain type from first update
+     - encrypted params: homomorphic weighted sum with integer sample counts, then divide by total samples after decrypt
+     - plaintext params: ordinary weighted average
+   - **CKKS path**:
+     - assumes encrypted tensors for processed keys
+     - weighted encrypted sum using float weights, then decrypt
+3. If all updates are marked `is_model_delta=True`, add aggregated delta to base global state
+4. `global_model.load_state_dict(new_state)`
+
+This supports mixed encrypted/plain aggregation in one round.
+
+---
+
+## 7. Main Runner (`fedavg_runner.py`)
+
+Implementation file:
+- [`src/fl/fedavg_runner.py`](/Users/ezhermemeti/Desktop/DATABASE/FLwithHE/src/fl/fedavg_runner.py)
+
+### 7.1 Dataset/model selection
+Datasets:
+- `mnist`
+- `cifar10`
+- `ptbxl`
+
+Model selection:
+- MNIST: `SimpleCNN`
+- CIFAR-10:
+  - DP off: `ResNetCIFAR10`
+  - DP on: `DPResNetCIFAR10` (GroupNorm variant)
+- PTB-XL: `cnn_medium`, `cnn_large`, `logistic`, `lstm`
+
+### 7.2 Partitioning
+- `--partition iid`
+- `--partition dirichlet --dirichlet_alpha <value>`
+
+### 7.3 HE setup
+- `--use_encryption`
+- `--encryption_scheme ckks|paillier`
+
+### 7.4 DP setup and guards
+- `--use_dp`
+- supported mode: `--dp_mode dp_sgd`
+- mechanisms: `--dp_mechanism gaussian|laplace`
+- validation checks for epsilon and laplace epsilon
+- warning when `local_epochs > 3`
+- `pretrain_rounds > 0` blocked when DP is enabled
+
+### 7.5 Round loop behavior
+Per round:
+1. Build each client + local train
+2. Aggregate updates
+3. Evaluate model
+4. Print performance and DP diagnostics
+5. Optionally append CSV row (`--save_metrics_csv`)
+
+### 7.6 DP mechanism comparison mode
+`--compare_dp_mechanisms` runs two experiments sequentially:
+- Gaussian
+- Laplace
+
+### 7.7 CSV writer in runner
+`_append_csv_row` writes a fixed schema used by plotting.
+
+Scheme label logic in CSV:
+- DP only: `dp_gaussian`, `dp_laplace`
+- HE only: `ckks`, `paillier`
+- HE+DP: `<he_scheme>+dp_<mechanism>`
+
+---
+
+## 8. DP Grid Search Utility
+
+Implementation file:
+- [`src/fl/dp_grid_search.py`](/Users/ezhermemeti/Desktop/DATABASE/FLwithHE/src/fl/dp_grid_search.py)
+
+Purpose:
+- CIFAR-10 utility to scan combinations of:
+  - mechanism
+  - epsilon per round
+  - clip norm
+
+Output:
+- console comparison table of final/best accuracies and estimated privacy quantities
+
+---
+
+## 9. CSV Contract
+
+Runner CSV columns:
+- `timestamp`
+- `round`
+- `dataset`
+- `model`
+- `num_clients`
+- `scheme`
+- `payload_mode`
+- `training_time`
+- `encrypt_time`
+- `aggregate_time`
+- `decrypt_time`
+- `he_total_time`
+- `total_round_time`
+- `ciphertext_count`
+- `encrypted_values`
+- `payload_nbytes`
+- `accuracy`
+- `loss`
+- `mean_abs_error`
+- `max_abs_error`
+- `analytics_reference`
+- `analytics_decrypted`
+- `integer_reference`
+- `integer_decrypted`
 
 Notes:
-- Prefer Gaussian first for stability.
-- Laplace can be significantly noisier in high dimensions.
-
-### Clipping Strategies (How clipping works)
-
-| Strategy | Flag | How it chooses clipping norm |
-|---|---|---|
-| Fixed | `--dp_clip_strategy fixed` | Always uses `--dp_clip_norm` |
-| Quantile | `--dp_clip_strategy quantile` | Uses current norm distribution percentile (`--dp_clip_quantile`) |
-| Adaptive | `--dp_clip_strategy adaptive` | EMA-smoothed quantile using `--dp_clip_alpha`, clamped by `--dp_clip_min/max` |
-
-Clipping directly sets sensitivity. Noise is calibrated from this effective clip norm.
-
-### Important DP Parameters
-
-| Parameter | Default | Description |
-|---|---:|---|
-| `--use_dp` | off | Enables DP |
-| `--dp_mode` | `dp_sgd` | `dp_sgd` |
-| `--dp_mechanism` | `gaussian` | `gaussian` or `laplace` |
-| `--dp_epsilon` | `1.0` | Per-round epsilon used by runner |
-| `--dp_target_delta` | `1e-5` | Delta for Gaussian |
-| `--dp_clip_strategy` | `adaptive` | `fixed`, `quantile`, `adaptive` |
-| `--dp_clip_norm` | `1.0` | Base clip norm |
-| `--dp_clip_quantile` | `50` | Percentile for quantile/adaptive |
-| `--dp_clip_alpha` | `0.9` | EMA smoothing for adaptive |
-| `--dp_clip_min` | `0.1` | Min clamp for adaptive/quantile |
-| `--dp_clip_max` | `10.0` | Max clamp for adaptive/quantile |
-| `--dp_debug` | off | Verbose clipping/noise diagnostics |
+- Current runner writes placeholders (`0` / `""`) for HE analytics-only fields not used in current full-model path.
 
 ---
 
-### How To Run: DP-SGD with different clipping strategies
+## 10. Plotting
 
-Base template:
+Implementation file:
+- [`src/utils/plot_he_comparison.py`](/Users/ezhermemeti/Desktop/DATABASE/FLwithHE/src/utils/plot_he_comparison.py)
 
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy <STRATEGY> --dp_clip_norm 1.0
+CLI:
+
+```bash
+python3 -m src.utils.plot_he_comparison \
+  --csv_files <file1.csv> [file2.csv ...] \
+  --payload_mode full_model|analytics|integer_stats \
+  --output_dir <plot_dir> \
+  [--sweep_mode] [--log_xscale]
 ```
 
-#### A) Fixed clipping
+Normalization map includes:
+- `paillier -> PHE`
+- `ckks -> FHE`
+- `dp_gaussian -> DP-GAUSSIAN`
+- `dp_laplace -> DP-LAPLACE`
+- combined labels (`+`) are normalized part-by-part
 
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy fixed --dp_clip_norm 1.0
-```
-
-#### B) Quantile clipping
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy quantile --dp_clip_quantile 50 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
-```
-
-#### C) Adaptive clipping
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
-```
-
-### How To Switch DP Mechanism (Gaussian vs Laplace)
-
-Only change:
-
-```cmd
---dp_mechanism gaussian
-```
-
-to:
-
-```cmd
---dp_mechanism laplace
-```
-
-Example (DP-SGD + Laplace + adaptive clipping):
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 5 --local_epochs 1 --batch_size 64 --lr 0.01 --use_dp --dp_mode dp_sgd --dp_mechanism laplace --dp_epsilon 3 --dp_clip_strategy adaptive --dp_clip_quantile 50 --dp_clip_alpha 0.9 --dp_clip_min 0.1 --dp_clip_max 10.0 --dp_clip_norm 1.0
-```
-
-### Debugging DP behavior
-
-Use:
-
-```cmd
-python -m src.fl.fedavg_runner --dataset mnist --num_clients 5 --rounds 2 --local_epochs 1 --use_dp --dp_mode dp_sgd --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 --dp_clip_strategy adaptive --dp_debug
-```
-
-Typical debug signals:
-
-```text
-raw_norm / clipped_norm
-clip_factor
-noise_scale
-signal_norm vs noise_norm ratio
-```
-
-### Understanding DP Logs (What each log means)
-
-Round log example:
-
-```text
-Round 03: Acc=78.40% Loss=0.9210 eps=9.0000 | Train=12.40s Encrypt=0.00s Agg=0.05s | DP(raw=2.311 clip=0.994 factor=0.430 noise_scale=0.812 noise_norm=7.921 n/s=3.124) | Total=12.58s Elapsed=39.91s
-```
-
-How to interpret:
-
-- `Acc`, `Loss`: global model quality on evaluation set.
-- `eps=...`: accumulated epsilon shown by the runner up to this round.
-- `Train`, `Encrypt`, `Agg`: time spent in local training, optional encryption, and server aggregation.
-- `DP(raw=...)`: average norm before clipping.
-- `DP(clip=...)`: average norm after clipping.
-- `DP(factor=...)`: average clipping multiplier in `[0, 1]`; smaller means stronger clipping.
-- `DP(noise_scale=...)`: calibrated Gaussian std (or Laplace scale) used for noise.
-- `DP(noise_norm=...)`: observed norm of sampled noise vector(s).
-- `DP(n/s=...)`: noise-to-signal ratio (`noise_norm / signal_norm` in this code path).
-
-Quick rules of thumb:
-
-- `clip << raw` and very small `factor` means aggressive clipping (possible underfitting).
-- Very large `n/s` means noise dominates signal (training may become unstable).
-- Stable useful training typically needs a balance: non-trivial clipping, but `n/s` not constantly extreme.
-
-### Suggested experiment order
-
-1. Baseline (`--use_dp` off).
-2. DP-SGD + Gaussian + adaptive clipping.
-3. DP-SGD + Gaussian + fixed clipping.
-4. DP-SGD + Laplace + adaptive clipping.
-
-Note: `local_epochs > 3` can hurt privacy/utility balance in DP runs; runner prints a warning.
+Supported outputs:
+- `full_model` plots
+- `analytics` plots
+- `integer_stats` plots
+- sweep plots (`--sweep_mode`)
 
 ---
 
+## 11. End-to-End Experiment Recipes
 
+### 11.1 Baseline (no DP, no HE)
 
-### Adım 1 — Veri Setini İndir
-
-Tarayıcıdan şu adrese git ve ZIP dosyasını indir (~1.8 GB):
-```
-https://physionet.org/content/ptb-xl/1.0.3/
-```
-
-### Adım 2 — ZIP'i Çıkart
-
-İndirilen ZIP'i şu klasöre çıkart:
-```
-FLwithHE/data/ptbxl/
+```bash
+python3 -m src.fl.fedavg_runner \
+  --dataset mnist \
+  --num_clients 5 \
+  --rounds 5 \
+  --local_epochs 1 \
+  --save_metrics_csv results/mnist_baseline.csv
 ```
 
-Sonuç şöyle görünmeli:
-```
-data/
-└── ptbxl/
-    └── ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/
-        ├── records100/
-        ├── records500/
-        ├── ptbxl_database.csv
-        └── scp_statements.csv
-```
+### 11.2 DP mechanism comparison
 
-### Adım 3 — Gerekli Paketi Kur
-
-```cmd
-pip install wfdb
+```bash
+python3 -m src.fl.fedavg_runner \
+  --dataset mnist \
+  --num_clients 5 \
+  --rounds 5 \
+  --local_epochs 1 \
+  --use_dp \
+  --dp_epsilon 3 \
+  --dp_target_delta 1e-5 \
+  --compare_dp_mechanisms \
+  --save_metrics_csv results/mnist_dp_compare.csv
 ```
 
-### Adım 4 — Dataset'i Test Et
+### 11.3 HE + DP comparison (example)
 
-```cmd
-python test_ptbxl.py
+CKKS + Gaussian:
+
+```bash
+python3 -m src.fl.fedavg_runner \
+  --dataset mnist \
+  --num_clients 5 \
+  --rounds 5 \
+  --local_epochs 1 \
+  --use_dp --dp_mechanism gaussian --dp_epsilon 3 --dp_target_delta 1e-5 \
+  --use_encryption --encryption_scheme ckks \
+  --save_metrics_csv results/mnist_he_dp_compare.csv
 ```
 
-Beklenen çıktı:
-```
-[PTBXLDataset] train: 19230 kayıt | sınıf dağılımı: {'NORM': 8314, 'MI': 3776, 'STTC': 2994, 'CD': 2971, 'HYP': 1175}
-[PTBXLDataset] test:  2158 kayıt  | sınıf dağılımı: {'NORM':  932, 'MI':  411, 'STTC':  351, 'CD':  351, 'HYP':  113}
-x shape  : torch.Size([32, 1000, 12])
-TEST BAŞARILI
-```
+Paillier + Laplace:
 
-### Adım 5 — Modeli Seç ve Çalıştır
-
-**CNN Medium (önerilen, hızlı):**
-```cmd
-python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_medium --num_clients 5 --rounds 5 --local_epochs 1
+```bash
+python3 -m src.fl.fedavg_runner \
+  --dataset mnist \
+  --num_clients 5 \
+  --rounds 5 \
+  --local_epochs 1 \
+  --use_dp --dp_mechanism laplace --dp_epsilon 3 \
+  --use_encryption --encryption_scheme paillier \
+  --save_metrics_csv results/mnist_he_dp_compare.csv
 ```
 
-**CNN Large:**
-```cmd
-python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_large --num_clients 5 --rounds 5 --local_epochs 1
+### 11.4 Plot comparison CSV
+
+```bash
+python3 -m src.utils.plot_he_comparison \
+  --csv_files results/mnist_dp_compare.csv results/mnist_he_dp_compare.csv \
+  --payload_mode full_model \
+  --output_dir plots/mnist
 ```
 
-**Logistic Regression (en hızlı, baseline):**
-```cmd
-python -m src.fl.fedavg_runner --dataset ptbxl --model logistic --num_clients 5 --rounds 5 --local_epochs 1
+---
+
+## 12. Full CLI Reference (Runner)
+
+Core training:
+- `--num_clients`
+- `--rounds`
+- `--local_epochs`
+- `--batch_size`
+- `--lr`
+- `--seed`
+- `--dataset mnist|cifar10|ptbxl`
+- `--partition iid|dirichlet`
+- `--dirichlet_alpha`
+- `--weight_decay`
+- `--scheduler none|step|cosine`
+- `--use_aug`
+- `--autoaugment`
+- `--no_cuda`
+
+PTB-XL:
+- `--ptbxl_model cnn_large|cnn_medium|logistic|lstm`
+- `--ptbxl_data_dir <path>`
+
+HE:
+- `--use_encryption`
+- `--encryption_scheme ckks|paillier`
+
+DP:
+- `--use_dp`
+- `--dp_mode dp_sgd`
+- `--dp_mechanism gaussian|laplace`
+- `--dp_epsilon`
+- `--dp_laplace_epsilon`
+- `--dp_target_delta`
+- `--dp_clip_norm`
+- `--dp_clip_strategy fixed|quantile|adaptive`
+- `--dp_clip_quantile`
+- `--dp_clip_alpha`
+- `--dp_clip_min`
+- `--dp_clip_max`
+- `--dp_noise_multiplier` (compatibility flag)
+- `--dp_debug`
+
+DP utility features:
+- `--warmup_rounds`
+- `--use_ema`
+- `--ema_decay`
+- `--pretrain_rounds`
+- `--baseline_compare`
+- `--compare_dp_mechanisms`
+
+CSV/plot compatibility:
+- `--save_metrics_csv <path>`
+- `--payload_mode full_model|analytics|integer_stats`
+
+---
+
+## 13. Dependencies and Installation
+
+Install all required packages:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
-.\.venv\Scripts\python.exe -m src.fl.fedavg_runner --dataset ptbxl --ptbxl_model logistic --num_clients 5 --rounds 5 --local_epochs 1
 
-**Şifreleme ile (Paillier):**
-```cmd
-python -m src.fl.fedavg_runner --dataset ptbxl --model cnn_medium --num_clients 5 --rounds 5 --use_encryption --encryption_scheme paillier
-```
+Important optional libs:
+- CKKS: `tenseal`
+- Paillier: `phe`
+- OpenDP helper functions: `opendp`
 
-### Sınıf Açıklamaları
+---
 
-| Sınıf | Etiket | Açıklama |
-|---|---|---|
-| NORM | 0 | Normal ECG |
-| MI | 1 | Miyokard Enfarktüsü |
-| STTC | 2 | ST/T Değişikliği |
-| CD | 3 | İletim Bozukluğu |
-| HYP | 4 | Hipertrofi |
+## 14. Troubleshooting
+
+- `ImportError: TenSEAL not installed`
+  - `pip install tenseal`
+- `ImportError: Paillier library 'phe' not installed`
+  - `pip install phe`
+- Plot script missing columns
+  - ensure CSV generated by current `fedavg_runner` and includes `scheme`, `payload_mode`
+- Slow DP-SGD
+  - current DP-SGD is per-example and intentionally exact/simple, so it is slower than vectorized/Opacus approaches
+
+---
+
+## 15. Implementation Caveats (Important)
+
+- Current `fedavg_runner` does not implement separate HE-only analytics/integer payload aggregation loops; it is centered on full-model FL updates.
+- `payload_mode` is currently a metadata field used for CSV/plot compatibility.
+- `ClientUpdate.is_model_delta` exists and aggregator supports delta add-back, but current client path sets `is_model_delta=False`.
+
