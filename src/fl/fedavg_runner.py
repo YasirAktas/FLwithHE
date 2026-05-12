@@ -10,7 +10,13 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from src.models.mnist_cnn import SimpleCNN
-from src.models.cifar_resnet18 import ResNetCIFAR10, DPResNetCIFAR10, EMAModel
+from src.models.cifar_resnet18 import (
+    ResNetCIFAR10,
+    DPResNetCIFAR10,
+    ImprovedCIFAR10CNN,
+    ResNet8CIFAR10,
+    EMAModel,
+)
 from src.models.ptbxl_cnn_large import PTBXL_CNN_Large
 from src.models.ptbxl_cnn_medium import PTBXL_CNN_Medium
 from src.models.ptbxl_logistic import PTBXL_Logistic
@@ -187,11 +193,31 @@ def run(config):
     if config.dataset == "mnist":
         global_model = SimpleCNN().to(device)
     elif config.dataset == "cifar10":
+        cifar_model = getattr(config, "cifar_model", "auto")
+        gn_groups = int(getattr(config, "gn_groups", 8))
         if use_dp:
-            global_model = DPResNetCIFAR10().to(device)
-            print("[DP] Using DPResNetCIFAR10 (GroupNorm instead of BatchNorm)")
+            if cifar_model in ("auto", "dpresnet18"):
+                global_model = DPResNetCIFAR10(num_groups=gn_groups).to(device)
+                model_label = f"DPResNetCIFAR10 (GroupNorm, num_groups={gn_groups})"
+            elif cifar_model == "resnet8":
+                global_model = ResNet8CIFAR10(num_groups=gn_groups).to(device)
+                model_label = f"ResNet8CIFAR10 (GroupNorm, num_groups={gn_groups})"
+            elif cifar_model == "improved":
+                global_model = ImprovedCIFAR10CNN().to(device)
+                model_label = "ImprovedCIFAR10CNN (GroupNorm)"
+            else:
+                raise ValueError(f"Unknown --cifar_model: {cifar_model}")
+            n_params = sum(p.numel() for p in global_model.parameters())
+            print(f"[DP] Using {model_label} - {n_params:,} parameters")
         else:
-            global_model = ResNetCIFAR10().to(device)
+            if cifar_model in ("auto", "dpresnet18"):
+                global_model = ResNetCIFAR10().to(device)
+            elif cifar_model == "resnet8":
+                global_model = ResNet8CIFAR10(num_groups=gn_groups).to(device)
+            elif cifar_model == "improved":
+                global_model = ImprovedCIFAR10CNN().to(device)
+            else:
+                raise ValueError(f"Unknown --cifar_model: {cifar_model}")
     elif config.dataset == "ptbxl":
         ptbxl_model = getattr(config, "ptbxl_model", "cnn_medium")
         if ptbxl_model == "cnn_large":
@@ -513,6 +539,26 @@ def parse_args():
                    default="./data/ptbxl/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3",
                    help="PTB-XL veri seti klasör yolu")
     p.add_argument("--use_aug", action="store_true")
+    p.add_argument(
+        "--cifar_model",
+        choices=["auto", "dpresnet18", "resnet8", "improved"],
+        default="auto",
+        help=(
+            "CIFAR-10 model selection. "
+            "'auto' = DPResNet-18 (DP) or ResNet-18 (non-DP) [default, backwards compatible]. "
+            "'resnet8' = small CIFAR ResNet-8 with GroupNorm (~78K params, DP-friendly). "
+            "'improved' = ImprovedCIFAR10CNN with 8 ResBlocks + GroupNorm (~4M params)."
+        ),
+    )
+    p.add_argument(
+        "--gn_groups",
+        type=int,
+        default=8,
+        help=(
+            "GroupNorm group count for DP-friendly CIFAR models. "
+            "DP-SGD literature suggests 16-32 for better noise/utility trade-off."
+        ),
+    )
     p.add_argument("--weight_decay", type=float, default=5e-4)
     p.add_argument("--scheduler", choices=["none", "step", "cosine"], default="none")
     p.add_argument("--partition", choices=["iid", "dirichlet"], default="iid")
