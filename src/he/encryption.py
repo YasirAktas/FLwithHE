@@ -4,7 +4,8 @@ Provides:
 - HomomorphicContext: fully homomorphic CKKS via TenSEAL
 - PaillierContext: additive partial HE via Paillier (integer-only scheme)
 """
-from typing import Any, Tuple
+import pickle
+from typing import Any, Dict, Tuple
 import torch
 try:
     import tenseal as ts
@@ -137,3 +138,47 @@ class PaillierContext:
         k = int(s)
         cts = [ct * k for ct in a.cts]
         return PaillierContext.EncryptedTensor(cts, a.shape)
+
+
+# ---------------------------------------------------------------------------
+# Payload measurement helpers (for client-to-server upload size reporting)
+# ---------------------------------------------------------------------------
+
+def is_encrypted_value(val: Any) -> bool:
+    """Return True if val is an encrypted tensor from a known HE context."""
+    return isinstance(val, (HomomorphicContext.EncryptedTensor, PaillierContext.EncryptedTensor))
+
+
+def measure_encrypted_value(val: Any) -> Tuple[int, int]:
+    """Return (ciphertext_count, payload_nbytes) for one encrypted value.
+
+    CKKS ciphertexts expose .serialize(); Paillier ciphertexts are pickled
+    since the phe library does not provide a stable wire-format API.
+    """
+    if isinstance(val, HomomorphicContext.EncryptedTensor):
+        nbytes = 0
+        for ct in val.cts:
+            nbytes += len(ct.serialize())
+        return len(val.cts), nbytes
+    if isinstance(val, PaillierContext.EncryptedTensor):
+        nbytes = 0
+        for ct in val.cts:
+            nbytes += len(pickle.dumps(ct, protocol=pickle.HIGHEST_PROTOCOL))
+        return len(val.cts), nbytes
+    return 0, 0
+
+
+def summarize_encrypted_state_dict(state_dict: Dict[str, Any]) -> Tuple[int, int]:
+    """Sum (ciphertext_count, payload_nbytes) over encrypted entries only.
+
+    Plaintext tensors in a mixed-mode state dict (e.g., Paillier last-layer
+    only) are skipped so the metric reflects actual encrypted payload.
+    """
+    total_ct = 0
+    total_nbytes = 0
+    for val in state_dict.values():
+        if is_encrypted_value(val):
+            ct, nb = measure_encrypted_value(val)
+            total_ct += ct
+            total_nbytes += nb
+    return total_ct, total_nbytes

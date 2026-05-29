@@ -7,7 +7,7 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
-from src.he.encryption import PaillierContext
+from src.he.encryption import PaillierContext, summarize_encrypted_state_dict
 from src.privacy.dp_utils import apply_dp_sgd
 
 @dataclass
@@ -26,6 +26,8 @@ class ClientUpdate:
     noise_norm: float = 0.0
     signal_noise_ratio: float = 0.0
     laplace_expected_noise_l2: float = 0.0
+    ciphertext_count: int = 0
+    payload_nbytes: int = 0
 
 class Client:
     def __init__(self, client_id: int, dataloader: DataLoader, device: torch.device, lr: float, momentum: float = 0.9, weight_decay: float = 0.0, scheduler: str = "none", encryption_context: Optional[object] = None, dp_clip_norm: Optional[float] = None, dp_mechanism: str = "gaussian", dp_epsilon: float = 0.0, dp_delta: float = 1e-5, dp_debug: bool = False, dp_clip_strategy: str = "fixed", dp_clip_quantile: float = 50.0, dp_clip_alpha: float = 0.9, dp_clip_min: float = 0.1, dp_clip_max: float = 10.0):
@@ -168,6 +170,8 @@ class Client:
         sd = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in sd.items()}
 
         encrypt_time = 0.0
+        ciphertext_count = 0
+        payload_nbytes = 0
         if self.encryption_context is not None:
             enc_start = time.time()
             # PaillierContext: only encrypt the final classifier layer; keep
@@ -184,6 +188,7 @@ class Client:
                 # CKKS or other contexts: encrypt all parameters (original behavior).
                 sd = {k: self.encryption_context.encrypt(v) for k, v in sd.items()}
             encrypt_time = time.time() - enc_start
+            ciphertext_count, payload_nbytes = summarize_encrypted_state_dict(sd)
         return ClientUpdate(
             state_dict=sd,
             num_samples=len(self.dataloader.dataset),
@@ -199,6 +204,8 @@ class Client:
             noise_norm=noise_norm,
             signal_noise_ratio=signal_noise_ratio,
             laplace_expected_noise_l2=laplace_expected_noise_l2,
+            ciphertext_count=ciphertext_count,
+            payload_nbytes=payload_nbytes,
         )
 
     def _is_last_layer_param(self, name: str) -> bool:

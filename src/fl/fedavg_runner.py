@@ -44,6 +44,16 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
+def _format_bytes(n: int) -> str:
+    """Human-readable byte size for log lines (B / KB / MB)."""
+    n = int(n)
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n / (1024 * 1024):.2f}MB"
+
+
 def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.device):
     model.eval()
     correct = 0
@@ -306,6 +316,7 @@ def run(config):
     if encryption_ctx is not None:
         scheme = getattr(config, "encryption_scheme", "ckks")
         print(f"[HE] Encryption: ACTIVE (dataset={config.dataset}, scheme={scheme})")
+        print("[HE] Payload metrics: ciphertext count + serialized size per round (encrypted tensors only)")
     else:
         print("[HE] Encryption: DISABLED for this run")
 
@@ -426,6 +437,14 @@ def run(config):
         aggregator.federated_average(client_updates, global_model)
         agg_time = time.time() - agg_start
 
+        he_stats_str = ""
+        if encryption_ctx is not None:
+            total_ct = sum(u.ciphertext_count for u in client_updates)
+            total_payload = sum(u.payload_nbytes for u in client_updates)
+            he_stats_str = (
+                f" | HE(ct={total_ct} payload={_format_bytes(total_payload)})"
+            )
+
         dp_stats_str = ""
         if use_dp and dp_mechanism in {"gaussian", "laplace"}:
             raw_norm_avg = sum(u.raw_update_norm for u in client_updates) / len(client_updates)
@@ -483,7 +502,7 @@ def run(config):
         print(
             f"Round {rnd:02d}: Acc={acc*100:.2f}%{ema_str} Loss={loss:.4f}{eps_str}{lr_str} "
             f"| Train={total_train_time:.2f}s Encrypt={total_encrypt_time:.2f}s "
-            f"Agg={agg_time:.2f}s{dp_stats_str} | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
+            f"Agg={agg_time:.2f}s{he_stats_str}{dp_stats_str} | Total={round_time:.2f}s Elapsed={elapsed:.2f}s"
         )
 
     # ----------------------------------------------------------------
