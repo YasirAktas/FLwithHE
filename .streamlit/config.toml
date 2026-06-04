@@ -1,0 +1,15 @@
+[theme]
+# The primary accent color (Cyan)
+primaryColor = "#00D2FF"
+
+# The main background color (Dark Navy/Charcoal)
+backgroundColor = "#0B0E14"
+
+# The background color for the sidebar and metric cards
+secondaryBackgroundColor = "#151A23"
+
+# The text color
+textColor = "#E2E8F0"
+
+# The global font family
+font = "sans serif"
